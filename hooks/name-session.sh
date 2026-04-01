@@ -214,18 +214,21 @@ try:
         )}]
     })
 
-    r = subprocess.run(
-        ["curl", "-s", "--max-time", "5",
-         "https://api.anthropic.com/v1/messages",
-         "-H", f"x-api-key: {token}",
-         "-H", "content-type: application/json",
-         "-H", "anthropic-version: 2023-06-01",
-         "-d", body],
-        capture_output=True, text=True, timeout=7
+    import urllib.request
+    api_req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body.encode(),
+        headers={
+            "x-api-key": token,
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+        },
     )
+    with urllib.request.urlopen(api_req, timeout=5) as api_resp:
+        resp_body = api_resp.read().decode()
 
-    if r.returncode == 0 and r.stdout:
-        resp = json.loads(r.stdout)
+    if resp_body:
+        resp = json.loads(resp_body)
         raw = resp.get("content", [{}])[0].get("text", "").strip()
         # Sanitize: lowercase, hyphens only, no special chars, max 30 chars
         raw = raw.lower().strip('`"\' ')

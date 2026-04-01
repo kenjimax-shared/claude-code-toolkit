@@ -182,9 +182,16 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
     res.end(UPLOAD_HTML);
   } else if (req.url === '/upload' && req.method === 'POST') {
+    const MAX_UPLOAD = 10 * 1024 * 1024; // 10 MB
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX_UPLOAD) { req.destroy(); res.writeHead(413, cors); res.end('Too large'); return; }
+      chunks.push(c);
+    });
     req.on('end', () => {
+      if (res.writableEnded) return;
       const buf = Buffer.concat(chunks);
       const ext = (req.headers['content-type'] || '').includes('png') ? '.png' :
                   (req.headers['content-type'] || '').includes('jpeg') ? '.jpg' :
@@ -193,7 +200,7 @@ const server = http.createServer((req, res) => {
       const filepath = path.join(uploadDir, name);
       fs.writeFileSync(filepath, buf);
       res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-      res.end(filepath);
+      res.end('/img/' + name);
     });
   } else if (req.url === '/sound2.mp3') {
     const stat = fs.statSync(soundFile);
@@ -312,6 +319,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Notification server on port ' + PORT);
+const BIND_HOST = process.env.NOTIFY_BIND_HOST || '127.0.0.1';
+server.listen(PORT, BIND_HOST, () => {
+  console.log('Notification server on ' + BIND_HOST + ':' + PORT);
 });

@@ -87,9 +87,11 @@ month_dir = os.path.join(sessions_root, now.strftime("%Y-%m"))
 os.makedirs(month_dir, exist_ok=True)
 
 # Filename: {tmux-name}_{session-prefix}.md or just {session-prefix}.md
+import re
 prefix = session_id[:8]
-if tmux_name:
-    filename = f"{tmux_name}_{prefix}.md"
+safe_tmux = re.sub(r'[^A-Za-z0-9._-]', '_', tmux_name) if tmux_name else None
+if safe_tmux:
+    filename = f"{safe_tmux}_{prefix}.md"
 else:
     filename = f"{prefix}.md"
 
