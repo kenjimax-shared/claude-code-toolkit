@@ -40,6 +40,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/no-gstack-login.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "bash \"$HOME/.claude/hooks/disk-check.sh\"",
             "timeout": 5,
             "statusMessage": "Checking disk space..."
