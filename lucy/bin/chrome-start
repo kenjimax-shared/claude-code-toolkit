@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# chrome-start: Launch the shared Chrome debug instance on port 9222
+# with flags that prevent Google from invalidating sessions.
+#
+# Usage:
+#   chrome-start              Launch headless (default)
+#   chrome-start --visible    Launch with UI visible
+#   chrome-start --check      Just check if Chrome is already running
+#
+# Anti-invalidation flags explained:
+#   --disable-sync                   Stops Chrome from syncing session state to Google servers
+#   --disable-background-networking  Stops Chrome from phoning home in the background
+#   --disable-features=...           Disables Chrome's identity management (DICE) which
+#                                    ties browser identity to Google web sessions and
+#                                    causes cross-tab sign-outs and session revocation
+#   --disable-client-side-phishing-detection  Stops Chrome from analyzing/reporting pages
+set -euo pipefail
+
+PORT=9222
+WIN_PROFILE='C:\Users\YOUR_USER\.claude\chrome-debug-profile'
+CHROME_EXE='C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
+POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+# ── Parse args ──
+MODE="headless"
+case "${1:-}" in
+  --visible) MODE="visible" ;;
+  --check)
+    if $POWERSHELL -NoProfile -Command "
+      try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $PORT); \$c.Close(); Write-Output 'alive' } catch { Write-Output 'dead' }
+    " 2>/dev/null | tr -d '\r' | grep -q 'alive'; then
+      echo "Chrome is running on port $PORT"
+      exit 0
+    else
+      echo "Chrome is NOT running on port $PORT"
+      exit 1
+    fi
+    ;;
+esac
+
+# ── Check if already running ──
+if $POWERSHELL -NoProfile -Command "
+  try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $PORT); \$c.Close(); Write-Output 'alive' } catch { Write-Output 'dead' }
+" 2>/dev/null | tr -d '\r' | grep -q 'alive'; then
+  echo "Chrome already running on port $PORT" >&2
+  exit 0
+fi
+
+# ── Build arguments ──
+# Core flags
+ARGS=(
+  "--remote-debugging-port=$PORT"
+  "--user-data-dir=$WIN_PROFILE"
+  "--no-first-run"
+)
+
+# Anti-invalidation flags: prevent Chrome from managing/reporting Google sessions
+ARGS+=(
+  "--disable-sync"
+  "--disable-background-networking"
+  "--disable-features=IdentityConsistency,SigninInterceptBubble,DiceWebSigninInterceptionFeature,DiceResponseHeader"
+  "--disable-client-side-phishing-detection"
+)
+
+# Headless flags
+if [ "$MODE" = "headless" ]; then
+  ARGS=("--headless=new" "--disable-gpu" "${ARGS[@]}")
+fi
+
+# Convert to PowerShell argument list format: '--flag1','--flag2',...
+PS_ARGS=$(printf "'%s'," "${ARGS[@]}")
+PS_ARGS="${PS_ARGS%,}"  # trim trailing comma
+
+# ── Launch ──
+echo "Launching Chrome on port $PORT ($MODE)..." >&2
+PID=$($POWERSHELL -NoProfile -Command "
+  \$p = Start-Process '$CHROME_EXE' -ArgumentList $PS_ARGS -PassThru
+  Write-Output \$p.Id
+" 2>/dev/null | tr -d '\r')
+
+if [ -z "$PID" ]; then
+  echo "ERROR: Failed to launch Chrome" >&2
+  exit 1
+fi
+
+# ── Wait for ready ──
+MAX_WAIT=15
+WAITED=0
+while [ $WAITED -lt $MAX_WAIT ]; do
+  if $POWERSHELL -NoProfile -Command "
+    try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $PORT); \$c.Close(); Write-Output 'ready' } catch { Write-Output 'waiting' }
+  " 2>/dev/null | tr -d '\r' | grep -q 'ready'; then
+    echo "Chrome ready on port $PORT (pid=$PID)" >&2
+    exit 0
+  fi
+  sleep 1
+  WAITED=$((WAITED + 1))
+done
+
+echo "WARNING: Chrome launched (pid=$PID) but may not be fully ready on port $PORT" >&2
+exit 0

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# chrome-mcp-toggle: Add/remove chrome-devtools MCP server from .mcp.json
+# Usage: chrome-mcp-toggle on|off|status
+
+set -euo pipefail
+
+MCP_JSON="$HOME/Claude/.mcp.json"
+SERVER_NAME="chrome-devtools"
+
+# The chrome-devtools-mcp server block to inject
+read -r -d '' CHROME_BLOCK << 'JSONEOF' || true
+{
+  "command": "cmd.exe",
+  "args": ["/c", "npx", "-y", "@anthropic-ai/chrome-devtools-mcp@0.20.2"],
+  "env": {
+    "CHROME_DEBUG_PORT": "9222",
+    "NODE_OPTIONS": "--max-old-space-size=2048"
+  }
+}
+JSONEOF
+
+has_server() {
+  python3 -c "
+import json, sys
+with open('$MCP_JSON') as f:
+    cfg = json.load(f)
+sys.exit(0 if '$SERVER_NAME' in cfg.get('mcpServers', {}) else 1)
+"
+}
+
+case "${1:-status}" in
+  on)
+    if has_server; then
+      echo "chrome-devtools is already in .mcp.json"
+      exit 0
+    fi
+    python3 -c "
+import json
+with open('$MCP_JSON') as f:
+    cfg = json.load(f)
+cfg['mcpServers']['$SERVER_NAME'] = json.loads('''$CHROME_BLOCK''')
+with open('$MCP_JSON', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+"
+    echo "Added chrome-devtools to .mcp.json. Restart terminal or run /mcp to pick it up."
+    ;;
+  off)
+    if ! has_server; then
+      echo "chrome-devtools is not in .mcp.json"
+      exit 0
+    fi
+    python3 -c "
+import json
+with open('$MCP_JSON') as f:
+    cfg = json.load(f)
+cfg['mcpServers'].pop('$SERVER_NAME', None)
+with open('$MCP_JSON', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+"
+    echo "Removed chrome-devtools from .mcp.json."
+    ;;
+  status)
+    if has_server; then
+      echo "chrome-devtools: ENABLED in .mcp.json"
+    else
+      echo "chrome-devtools: DISABLED (not in .mcp.json)"
+    fi
+    ;;
+  *)
+    echo "Usage: chrome-mcp-toggle on|off|status"
+    exit 1
+    ;;
+esac

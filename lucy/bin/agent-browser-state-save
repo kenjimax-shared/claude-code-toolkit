@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# agent-browser-state-save: periodically save session state for all active agent-browser sessions
+# This ensures session cookies survive Chrome crashes/kills (not just clean 'close').
+# Designed to run via cron every 1-2 minutes.
+
+set -euo pipefail
+
+SESSIONS_DIR="$HOME/.agent-browser/sessions"
+AB="$HOME/.npm-global/bin/agent-browser"
+LOG_PREFIX="[agent-browser-state-save]"
+
+# Load encryption key if available
+if [ -f "$HOME/.agent-browser/.encryption-key" ]; then
+  export AGENT_BROWSER_ENCRYPTION_KEY="$(cat "$HOME/.agent-browser/.encryption-key")"
+fi
+
+mkdir -p "$SESSIONS_DIR"
+
+# Determine the --session-name (original) for a session by reverse-looking
+# up the terminal-owners .map files. Format: original=derivative.
+# Falls back to the session name itself if no mapping found.
+get_session_name() {
+  local session="$1"
+  local owners_dir="$HOME/.agent-browser/terminal-owners"
+  # Scan all .map files for a line where session appears as the value
+  if [ -d "$owners_dir" ]; then
+    local original
+    original=$(grep -rh "=${session}$" "$owners_dir"/*.map 2>/dev/null \
+      | head -1 | cut -d= -f1) || true
+    if [ -n "$original" ]; then
+      echo "$original"
+      return
+    fi
+  fi
+  echo "$session"
+}
+
+# Get active sessions: strip ANSI codes, remove header, remove arrow indicator, keep only valid names
+active=$("$AB" session list 2>/dev/null \
+  | sed 's/\x1b\[[0-9;]*m//g' \
+  | grep -v "Active sessions:" \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+  | sed 's/^→[[:space:]]*//' \
+  | grep -E '^[a-zA-Z0-9_-]+$' \
+  | xargs)
+
+if [ -z "$active" ]; then
+  exit 0
+fi
+
+saved=0
+failed=0
+failed_names=()
+
+for session in $active; do
+  # Determine correct session-name (may differ for derivative sessions)
+  sname=$(get_session_name "$session")
+  # Save state using the --session-name convention: {session}-{sname}.json
+  outfile="$SESSIONS_DIR/${session}-${sname}.json"
+  err=$("$AB" --session "$session" state save "$outfile" 2>&1) || true
+  # Check for both .json and .json.enc (encryption appends .enc)
+  if { [ -f "$outfile" ] && [ -s "$outfile" ]; } || \
+     { [ -f "${outfile}.enc" ] && [ -s "${outfile}.enc" ]; }; then
+    saved=$((saved + 1))
+  else
+    failed=$((failed + 1))
+    failed_names+=("$session")
+  fi
+done
+
+msg="$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX saved=$saved failed=$failed sessions=[$active]"
+if [ ${#failed_names[@]} -gt 0 ]; then
+  msg="$msg failed_sessions=[${failed_names[*]}]"
+fi
+echo "$msg"
+
+# ── Stale Chrome Reaper ──────────────────────────────────────────
+# Kill agent-browser Chrome instances older than 6 hours with no active CLI parent.
+# Each agent-browser session runs Chrome with a --user-data-dir in /tmp.
+REAP_HOURS=6
+reaped=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  chrome_pid=$(echo "$line" | awk '{print $1}')
+  # Extract the user-data-dir from the command line
+  udd=$(cat /proc/"$chrome_pid"/cmdline 2>/dev/null | tr '\0' '\n' | grep -- '--user-data-dir' | sed 's/--user-data-dir=//')
+  [ -z "$udd" ] && continue
+
+  # Check age via the user-data-dir creation time
+  if [ -d "$udd" ]; then
+    dir_age_sec=$(( $(date +%s) - $(stat -c %Y "$udd" 2>/dev/null || echo "0") ))
+    if [ "$dir_age_sec" -gt $(( REAP_HOURS * 3600 )) ]; then
+      # Verify no agent-browser CLI parent is still alive
+      parent_pid=$(ps -o ppid= -p "$chrome_pid" 2>/dev/null | tr -d ' ')
+      parent_cmd=$(ps -o comm= -p "$parent_pid" 2>/dev/null || echo "")
+      if ! echo "$parent_cmd" | grep -q "agent-browser"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaping stale Chrome PID $chrome_pid (age: $((dir_age_sec/3600))h, udd: $udd)"
+        kill "$chrome_pid" 2>/dev/null || true
+        reaped=$((reaped + 1))
+      fi
+    fi
+  fi
+done < <(ps -eo pid,args 2>/dev/null | grep '[c]hrome.*--user-data-dir=/tmp' | grep -v grep)
+
+if [ "$reaped" -gt 0 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaped $reaped stale Chrome instance(s)"
+fi

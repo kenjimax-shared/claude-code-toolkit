@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# lucy-status: Show all Lucy tasks and their states
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+status_color() {
+  case "$1" in
+    running)   echo -e "${GREEN}running${NC}" ;;
+    pr_open)   echo -e "${BLUE}pr_open${NC}" ;;
+    reviewing) echo -e "${CYAN}reviewing${NC}" ;;
+    verifying) echo -e "${CYAN}verifying${NC}" ;;
+    ready)     echo -e "${BOLD}${GREEN}ready${NC}" ;;
+    merged)    echo -e "${GRAY}merged${NC}" ;;
+    failed)    echo -e "${RED}failed${NC}" ;;
+    killed)    echo -e "${GRAY}killed${NC}" ;;
+    stuck)     echo -e "${YELLOW}stuck${NC}" ;;
+    *)         echo "$1" ;;
+  esac
+}
+
+# Parse args
+STATUS_FILTER=""
+GROUP_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --group)  GROUP_FILTER="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: lucy-status [status-filter] [--group <name>]"
+      exit 0
+      ;;
+    *) STATUS_FILTER="$1"; shift ;;
+  esac
+done
+
+TASKS=$(read_tasks)
+COUNT=$(echo "$TASKS" | jq 'length')
+
+if [ "$COUNT" -eq 0 ]; then
+  echo "No active tasks."
+  exit 0
+fi
+
+TITLE="Lucy Tasks"
+if [ -n "$GROUP_FILTER" ]; then
+  TITLE="Lucy Tasks [group: $GROUP_FILTER]"
+fi
+echo -e "${BOLD}${TITLE}${NC} ($COUNT total)"
+echo ""
+
+echo "$TASKS" | jq -c '.[]' | while IFS= read -r task; do
+  id=$(echo "$task" | jq -r '.id')
+  status=$(echo "$task" | jq -r '.status')
+  model=$(echo "$task" | jq -r '.model')
+  repo=$(echo "$task" | jq -r '.repo')
+  group=$(echo "$task" | jq -r '.group // "default"')
+  desc=$(echo "$task" | jq -r '.description' | cut -c1-60)
+  tmux_name=$(echo "$task" | jq -r '.tmux')
+  pr=$(echo "$task" | jq -r '.pr // empty')
+  spawned=$(echo "$task" | jq -r '.spawned_at')
+  retries=$(echo "$task" | jq -r '.retries')
+
+  # Apply filters
+  if [ -n "$STATUS_FILTER" ] && [ "$status" != "$STATUS_FILTER" ]; then
+    continue
+  fi
+  if [ -n "$GROUP_FILTER" ] && [ "$group" != "$GROUP_FILTER" ]; then
+    continue
+  fi
+
+  # Check if tmux session is actually alive
+  tmux_alive="no"
+  if tmux has-session -t "$tmux_name" 2>/dev/null; then
+    tmux_alive="yes"
+  fi
+
+  # Check if agent wrote a stuck file
+  worktree=$(echo "$task" | jq -r '.worktree')
+  stuck=""
+  if [ -f "$worktree/.lucy-stuck.md" ]; then
+    stuck=" [STUCK]"
+  fi
+
+  echo -e "  ${BOLD}$id${NC}"
+  echo -e "    Status:  $(status_color "$status")$stuck"
+  echo -e "    Group:   $group | Repo: $repo | Model: $model | tmux: $tmux_alive"
+  echo -e "    Desc:    $desc"
+  if [ -n "$pr" ]; then
+    echo -e "    PR:      #$pr"
+  fi
+  echo -e "    Spawned: $spawned | Retries: $retries"
+  echo ""
+done

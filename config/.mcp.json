@@ -1,0 +1,45 @@
+{
+  "_comment": "Project-level MCP config. Copy to your project root as .mcp.json",
+  "mcpServers": {
+    "google-ads": {
+      "command": "google-ads-mcp",
+      "env": {
+        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN",
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MCC_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS": "$HOME/.google_workspace_mcp/serviceaccount.json"
+      }
+    },
+    "google-analytics": {
+      "command": "analytics-mcp",
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "$HOME/.google_workspace_mcp/serviceaccount.json"
+      }
+    },
+    "chrome-devtools": {
+      "command": "cmd.exe",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@anthropic-ai/chrome-devtools-mcp@latest"
+      ],
+      "env": {
+        "CHROME_DEBUG_PORT": "9222",
+        "NODE_OPTIONS": "--max-old-space-size=2048"
+      }
+    },
+    "google-workspace": {
+      "command": "uvx",
+      "args": [
+        "workspace-mcp",
+        "--tool-tier",
+        "complete"
+      ],
+      "env": {
+        "GOOGLE_OAUTH_CLIENT_ID": "YOUR_OAUTH_CLIENT_ID",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "YOUR_OAUTH_CLIENT_SECRET",
+        "WORKSPACE_MCP_PORT": "0"
+      }
+    }
+  }
+}

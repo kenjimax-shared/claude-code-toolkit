@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# lucy-verify: Antagonistic verification of task acceptance criteria
+# Reads .lucy-plan.md and launches a reviewer to independently verify each criterion
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-verify <task-id>"
+  echo ""
+  echo "Launches an antagonistic reviewer that independently verifies"
+  echo "each acceptance criterion from the task's plan."
+  echo ""
+  echo "Tasks:"
+  read_tasks | jq -r '.[] | "  \(.id) (\(.status))"'
+  exit 1
+fi
+
+TASK_ID="$1"
+
+TASK=$(get_task "$TASK_ID")
+if [ -z "$TASK" ]; then
+  echo "Error: Task '$TASK_ID' not found"
+  exit 1
+fi
+
+WORKTREE=$(echo "$TASK" | jq -r '.worktree')
+REPO=$(echo "$TASK" | jq -r '.repo')
+TYPE=$(echo "$TASK" | jq -r '.type')
+
+# Safe defaults for variables that may not be set for all task types
+REMOTE=""
+PR=""
+
+# For ops tasks, metadata lives in the task dir; for code tasks, in the worktree
+if [ "$TYPE" = "ops" ]; then
+  META_DIR="$LUCY_DIR/tasks/${TASK_ID}"
+else
+  META_DIR="$WORKTREE"
+fi
+
+# Read the plan
+PLAN_FILE="$META_DIR/.lucy-plan.md"
+if [ ! -f "$PLAN_FILE" ]; then
+  echo "Error: No plan file at $PLAN_FILE"
+  echo "The agent should have created .lucy-plan.md before starting work."
+  exit 1
+fi
+
+PLAN=$(cat "$PLAN_FILE")
+
+# For ops tasks, also read the done file if present
+DONE_SUMMARY=""
+DONE_FILE="$META_DIR/.lucy-done.md"
+if [ -f "$DONE_FILE" ]; then
+  DONE_SUMMARY=$(cat "$DONE_FILE")
+fi
+
+# For code tasks, get the PR diff
+PR_CONTEXT=""
+PR=$(echo "$TASK" | jq -r '.pr // empty')
+if [ -n "$PR" ] && [ -n "$REPO" ]; then
+  REPO_DIR="$WORKTREE_ROOT/$REPO"
+  ORIGIN=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | sed 's/.*github.com[:/]\(.*\)/\1/')
+  PARENT=$(gh api "repos/$ORIGIN" --jq '.parent.full_name // empty' 2>/dev/null || echo "")
+  REMOTE="${PARENT:-$ORIGIN}"
+
+  PR_DIFF=$(gh pr diff "$PR" --repo "$REMOTE" 2>/dev/null || echo "")
+  if [ -n "$PR_DIFF" ]; then
+    # Truncate if huge
+    if [ ${#PR_DIFF} -gt 40000 ]; then
+      PR_DIFF="${PR_DIFF:0:40000}
+
+... [diff truncated]"
+    fi
+    PR_CONTEXT="
+## PR #$PR Diff
+\`\`\`diff
+$PR_DIFF
+\`\`\`"
+  fi
+fi
+
+# Build PR-specific instructions (only for code tasks with a PR)
+PR_INSTRUCTIONS=""
+if [ -n "$PR" ] && [ -n "$REMOTE" ]; then
+  PR_INSTRUCTIONS="
+### For code tasks (if there's a PR)
+Post a comment on the PR using:
+\`\`\`
+gh pr comment $PR --repo $REMOTE --body \"<your verification report>\"
+\`\`\`
+"
+fi
+
+log "VERIFY $TASK_ID: Starting antagonistic verification"
+
+# Build verification prompt
+VERIFY_PROMPT="You are an antagonistic reviewer for Lucy. Your job is to independently verify that a task was completed correctly by checking each acceptance criterion from the plan.
+
+You are NOT the agent that did the work. You are a skeptical verifier. Do not trust claims; verify them yourself.
+
+## The Plan
+
+$PLAN
+
+## Agent's Completion Summary
+
+${DONE_SUMMARY:-"(No completion summary provided. The agent may have created a PR instead.)"}
+$PR_CONTEXT
+
+## Your Instructions
+
+Go through EACH acceptance criterion from the plan above and verify it:
+
+1. For code criteria: check the diff, read the changed files, run the tests/linter if applicable
+2. For operational criteria (tracking, API config, etc.): actually test it. Use the browser, make API calls, check dashboards. Do not just read the agent's summary and say 'looks good.'
+3. For each criterion, mark it VERIFIED or FAILED with evidence
+
+After checking all criteria, post your results.
+${PR_INSTRUCTIONS}
+### For all tasks
+Write your results to \`$META_DIR/.lucy-verification.md\` with this format:
+
+\`\`\`markdown
+# Verification Report
+
+## Criteria Results
+1. [VERIFIED/FAILED] <criterion text> - <evidence>
+2. [VERIFIED/FAILED] <criterion text> - <evidence>
+...
+
+## Verdict
+PASS / FAIL
+
+## Notes
+<any additional observations>
+\`\`\`
+
+Start your report with:
+## Lucy Verification
+
+Be thorough. Be skeptical. If you cannot verify a criterion (e.g., you don't have access to the system), mark it UNVERIFIABLE and explain why."
+
+# Write prompt to temp file
+VERIFY_PROMPT_FILE=$(mktemp /tmp/lucy-verify-XXXXXX.md)
+echo "$VERIFY_PROMPT" > "$VERIFY_PROMPT_FILE"
+
+VERIFY_LOG="$LUCY_DIR/logs/${TASK_ID}-verify.log"
+
+# Launch verification agent in tmux
+VERIFY_TMUX="${TMUX_PREFIX}-v-${TASK_ID}"
+if [ ${#VERIFY_TMUX} -gt 80 ]; then
+  VERIFY_TMUX="${VERIFY_TMUX:0:80}"
+fi
+
+# Kill existing verify session if any
+tmux kill-session -t "$VERIFY_TMUX" 2>/dev/null || true
+
+# For ops tasks, use the task metadata dir; for code tasks, use the worktree
+VERIFY_CWD="${WORKTREE:-$META_DIR}"
+if [ "$TYPE" = "ops" ]; then
+  VERIFY_CWD="$META_DIR"
+fi
+tmux new-session -d -s "$VERIFY_TMUX" -c "$VERIFY_CWD"
+tmux send-keys -t "$VERIFY_TMUX" "codex exec --model gpt-5.4 -c reasoning_effort=xhigh --dangerously-bypass-approvals-and-sandbox \"\$(cat $VERIFY_PROMPT_FILE)\" > $VERIFY_LOG 2>&1; rm -f $VERIFY_PROMPT_FILE; exit" Enter
+
+update_task "$TASK_ID" "status" '"verifying"'
+
+log "VERIFY $TASK_ID: Verification agent launched in $VERIFY_TMUX"
+
+echo "Verification launched for $TASK_ID"
+echo "  tmux: $VERIFY_TMUX"
+echo "  Log:  $VERIFY_LOG"
+echo "  Plan: $PLAN_FILE"

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# lucy-review: Run adversarial code review on a PR using multiple models
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+REVIEW_MODEL="gpt-5.4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model|-m)
+      REVIEW_MODEL="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1"; exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-review [--model <model>] <task-id>"
+  echo ""
+  echo "Triggers adversarial review on the task's PR."
+  echo "Default model: gpt-5.4-xhigh"
+  echo ""
+  echo "Tasks with PRs:"
+  read_tasks | jq -r '.[] | select(.pr != null) | "  \(.id) (PR #\(.pr))"'
+  exit 1
+fi
+
+TASK_ID="$1"
+
+TASK=$(get_task "$TASK_ID")
+if [ -z "$TASK" ]; then
+  echo "Error: Task '$TASK_ID' not found"
+  exit 1
+fi
+
+PR=$(echo "$TASK" | jq -r '.pr // empty')
+REPO=$(echo "$TASK" | jq -r '.repo')
+WORKTREE=$(echo "$TASK" | jq -r '.worktree')
+
+if [ -z "$PR" ]; then
+  echo "Error: Task '$TASK_ID' has no PR"
+  exit 1
+fi
+
+REPO_DIR="$WORKTREE_ROOT/$REPO"
+ORIGIN=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | sed 's/.*github.com[:/]\(.*\)/\1/')
+# Check if fork; PRs go to parent repo
+PARENT=$(gh api "repos/$ORIGIN" --jq '.parent.full_name // empty' 2>/dev/null || echo "")
+REMOTE="${PARENT:-$ORIGIN}"
+
+if [ -z "$REMOTE" ]; then
+  echo "Error: Could not determine GitHub remote for $REPO"
+  exit 1
+fi
+
+log "REVIEW $TASK_ID: Starting adversarial review on PR #$PR"
+
+# Get the PR diff
+PR_DIFF=$(gh pr diff "$PR" --repo "$REMOTE" 2>/dev/null || echo "(Could not fetch diff)")
+
+# Get PR title and body for context
+PR_TITLE=$(gh pr view "$PR" --repo "$REMOTE" --json title --jq '.title' 2>/dev/null || echo "")
+PR_BODY=$(gh pr view "$PR" --repo "$REMOTE" --json body --jq '.body' 2>/dev/null || echo "")
+
+# Truncate diff if too large (Claude context limits)
+if [ ${#PR_DIFF} -gt 50000 ]; then
+  PR_DIFF="${PR_DIFF:0:50000}
+
+... [diff truncated, ${#PR_DIFF} chars total]"
+fi
+
+# Create review prompt
+REVIEW_PROMPT="You are reviewing PR #$PR in $REMOTE.
+
+Title: $PR_TITLE
+
+Description:
+$PR_BODY
+
+Diff:
+\`\`\`diff
+$PR_DIFF
+\`\`\`
+
+Review this PR carefully. Focus on:
+1. Logic errors, off-by-one bugs, race conditions
+2. Security issues (injection, XSS, leaked secrets)
+3. Edge cases not handled
+4. Breaking changes to existing functionality
+
+If you find issues, categorize each as CRITICAL (blocks merge) or WARNING (should fix but not blocking).
+
+If the code looks correct, say so clearly.
+
+Format your review as a GitHub PR comment. Start with:
+## Lucy Review ($REVIEW_MODEL)
+
+Then list your findings. At the end, give a verdict: APPROVE, REQUEST CHANGES, or COMMENT.
+
+Post your review using this exact command:
+gh pr comment $PR --repo $REMOTE --body \"<your review>\"
+"
+
+# Write review prompt to temp file
+REVIEW_PROMPT_FILE=$(mktemp /tmp/lucy-review-XXXXXX.md)
+echo "$REVIEW_PROMPT" > "$REVIEW_PROMPT_FILE"
+
+REVIEW_LOG="$LUCY_DIR/logs/${TASK_ID}-review.log"
+
+# Launch Claude review in a tmux session
+REVIEW_TMUX="${TMUX_PREFIX}-r-${TASK_ID}"
+if [ ${#REVIEW_TMUX} -gt 80 ]; then
+  REVIEW_TMUX="${REVIEW_TMUX:0:80}"
+fi
+
+# Kill existing review session if any
+tmux kill-session -t "$REVIEW_TMUX" 2>/dev/null || true
+
+tmux new-session -d -s "$REVIEW_TMUX" -c "$WORKTREE"
+tmux send-keys -t "$REVIEW_TMUX" "codex exec --model $REVIEW_MODEL --dangerously-bypass-approvals-and-sandbox \"\$(cat $REVIEW_PROMPT_FILE)\" 2>&1 | tee $REVIEW_LOG; rm -f $REVIEW_PROMPT_FILE" Enter
+
+log "REVIEW $TASK_ID: $REVIEW_MODEL review launched in $REVIEW_TMUX"
+update_task "$TASK_ID" "checks.review_codex" '"pending"'
+
+echo "Review launched for $TASK_ID (PR #$PR) using $REVIEW_MODEL"
+echo "  tmux: $REVIEW_TMUX"
+echo "  Log:  $REVIEW_LOG"

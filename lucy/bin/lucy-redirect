@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# lucy-redirect: Send a message to a running agent
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 2 ]; then
+  echo "Usage: lucy-redirect <task-id> <message>"
+  echo ""
+  echo "Example: lucy-redirect cab-123 \"Stop. Focus on the API layer first.\""
+  echo ""
+  echo "Running tasks:"
+  read_tasks | jq -r '.[] | select(.status == "running") | "  \(.id)"'
+  exit 1
+fi
+
+TASK_ID="$1"
+shift
+MESSAGE="$*"
+
+TASK=$(get_task "$TASK_ID")
+if [ -z "$TASK" ]; then
+  echo "Error: Task '$TASK_ID' not found"
+  exit 1
+fi
+
+TMUX_SESSION=$(echo "$TASK" | jq -r '.tmux')
+
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "Error: tmux session '$TMUX_SESSION' is not running"
+  exit 1
+fi
+
+echo "Sending to $TMUX_SESSION: $MESSAGE"
+tmux send-keys -t "$TMUX_SESSION" "$MESSAGE" Enter
+
+log "REDIRECT $TASK_ID message=$(echo "$MESSAGE" | cut -c1-80)"
+echo "Message sent."

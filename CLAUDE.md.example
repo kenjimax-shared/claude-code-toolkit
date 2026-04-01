@@ -1,0 +1,27 @@
+# CLAUDE.md - Example Configuration
+
+This is an example CLAUDE.md showing how to configure Claude Code with this toolkit.
+Place your customized version at the root of your project directory.
+
+## Chrome Tab Isolation (Automated)
+- Tab ownership is tracked automatically via `chrome-tabs` (`~/.claude/lucy/bin/chrome-tabs`).
+- A **PostToolUse hook** records every tab opened via `new_page` in the Chrome DevTools MCP.
+- A **Stop hook** closes only tabs owned by this session on exit. No manual cleanup needed.
+- **Do NOT manually close tabs** you didn't open. The system handles cleanup.
+
+## Google MCP Servers - Tool Selection
+Three Google MCP servers are configured. Use the right one for the job:
+
+- **google-workspace**: Default for ALL Google interactions (Drive, Docs, Sheets, Gmail, Calendar, etc.)
+- **google-sheets-deep**: Only for intensive Sheets work: complex formulas, batch updates, multi-sheet analysis.
+- **bigquery**: For all BigQuery queries and dataset exploration.
+
+## Web Browsing - Tool Preference (MCP-First Policy)
+- **NEVER use a browser for anything that has an MCP server or API token.** Browser logins expire fast; API tokens do not.
+- **For services that need login sessions**: Use **agent-browser** with persistent profiles. Each service has its own isolated Chrome profile.
+- **Default to gstack browse** (Playwright) for general web browsing that needs no login.
+- **Fall back to Chrome DevTools MCP** only when you need Chrome extensions or shared debug browser state.
+- **Chrome launch**: Always use `chrome-start` to launch the shared instance. It includes anti-invalidation flags that prevent Chrome from revoking Google sessions.
+
+## Session Snooze
+When the user says "snooze this terminal" or "snooze this session" followed by a time, use the snooze-resume system to schedule a wake-up via cron.

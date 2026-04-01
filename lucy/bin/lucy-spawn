@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# lucy-spawn: Create a worktree, assemble prompt, launch an agent in tmux
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: lucy-spawn --repo <name> --desc <description> [options]
+
+Required:
+  --repo <name>       Repository name (directory under ~/Claude/)
+  --desc <text>       Task description
+
+Options:
+  --type <type>       Task type: feature|bugfix|refactor|ops (default: feature)
+  --model <model>     Model: sonnet|opus|haiku|codex|codex-max|codex-mini|gpt54 (auto-selected if omitted)
+  --issue <number>    GitHub issue number (fetches body for context)
+  --context <file>    Context file from lucy/context/ to inject (can be repeated)
+  --group <name>      Group name for project siloing (auto-inferred from repo if omitted)
+  --slug <text>       Custom slug for branch/worktree name
+  --max-retries <n>   Max retries on failure (default: 3)
+
+Example:
+  lucy-spawn --repo Cabana --type bugfix --model sonnet \
+    --desc "Fix typo in README" --issue 123
+USAGE
+  exit 1
+}
+
+# Parse args
+REPO="" TYPE="feature" MODEL="" MODEL_EXPLICIT=false ISSUE="" SLUG="" DESC="" MAX_R="$MAX_RETRIES"
+GROUP="" GROUP_EXPLICIT=false
+CONTEXT_FILES=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)    REPO="$2"; shift 2 ;;
+    --type)    TYPE="$2"; shift 2 ;;
+    --model)   MODEL="$2"; MODEL_EXPLICIT=true; shift 2 ;;
+    --issue)   ISSUE="$2"; shift 2 ;;
+    --context) CONTEXT_FILES+=("$2"); shift 2 ;;
+    --group)   GROUP="$2"; GROUP_EXPLICIT=true; shift 2 ;;
+    --slug)    SLUG="$2"; shift 2 ;;
+    --desc)    DESC="$2"; shift 2 ;;
+    --max-retries) MAX_R="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+
+# Auto-infer group from repo if not explicitly provided
+if ! $GROUP_EXPLICIT; then
+  if [ -n "$REPO" ] && [[ -n "${REPO_GROUP_MAP[$REPO]+x}" ]]; then
+    GROUP="${REPO_GROUP_MAP[$REPO]}"
+  else
+    GROUP="$DEFAULT_GROUP"
+  fi
+fi
+
+[[ -z "$DESC" ]] && echo "Error: --desc is required" && usage
+
+# Auto-select model if not explicitly provided
+if ! $MODEL_EXPLICIT; then
+  MODEL=$(auto_select_model "$TYPE" "$DESC")
+  echo "Auto-selected model: $MODEL (${MODEL_MAP[$MODEL]})"
+fi
+
+# Repo is required for code tasks, optional for ops
+if [ -z "$REPO" ] && [ "$TYPE" != "ops" ]; then
+  echo "Error: --repo is required (unless --type ops)"
+  usage
+fi
+
+# Validate repo exists (optional for ops tasks)
+REPO_DIR="$WORKTREE_ROOT/$REPO"
+if [ -n "$REPO" ] && [ ! -d "$REPO_DIR/.git" ] && [ ! -d "$REPO_DIR" ]; then
+  echo "Error: $REPO_DIR does not exist"
+  exit 1
+fi
+
+# Validate model
+if [[ -z "${MODEL_MAP[$MODEL]+x}" ]]; then
+  echo "Error: Unknown model '$MODEL'. Options: sonnet, opus, haiku, codex, codex-max, codex-mini, gpt54"
+  exit 1
+fi
+
+# Ops tasks: repo is optional, skip worktree
+IS_OPS=false
+if [ "$TYPE" = "ops" ]; then
+  IS_OPS=true
+fi
+
+# Check available memory before spawning
+AVAIL_MEM_MB=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+if [ "$AVAIL_MEM_MB" -gt 0 ] && [ "$AVAIL_MEM_MB" -lt "$MIN_AVAIL_MEM_MB" ]; then
+  echo "Error: Only ${AVAIL_MEM_MB}MB available memory (minimum ${MIN_AVAIL_MEM_MB}MB required)"
+  echo "Kill some agents with lucy-kill or wait for them to finish."
+  exit 1
+fi
+
+# Check concurrent agent limit
+RUNNING=$(jq '[.[] | select(.status == "running")] | length' "$TASKS_FILE" 2>/dev/null || echo 0)
+if [ "$RUNNING" -ge "$MAX_CONCURRENT" ]; then
+  echo "Error: $RUNNING agents already running (max $MAX_CONCURRENT)"
+  exit 1
+fi
+
+# Generate task ID and slug
+if [ -z "$SLUG" ]; then
+  SLUG=$(echo "$DESC" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 ]//g' | tr ' ' '-' | cut -c1-40 | sed 's/-$//')
+fi
+
+REPO_LOWER="${REPO,,}"
+TASK_ID="${REPO_LOWER:+${REPO_LOWER}-}${ISSUE:+${ISSUE}-}${SLUG}"
+# Remove leading dash if no repo
+TASK_ID="${TASK_ID#-}"
+
+if $IS_OPS; then
+  BRANCH=""
+  WORKTREE_DIR=""
+else
+  BRANCH="feat/${TASK_ID}"
+  if [ "$TYPE" = "bugfix" ]; then
+    BRANCH="fix/${TASK_ID}"
+  elif [ "$TYPE" = "refactor" ]; then
+    BRANCH="refactor/${TASK_ID}"
+  fi
+  WORKTREE_DIR="$WORKTREE_ROOT/${REPO}-worktrees/${TASK_ID}"
+fi
+
+TMUX_SESSION="${TMUX_PREFIX}-w-${TASK_ID}"
+AGENT_LOG="$LUCY_DIR/logs/${TASK_ID}.log"
+
+# Check if task already exists
+if jq -e ".[] | select(.id == \"$TASK_ID\")" "$TASKS_FILE" >/dev/null 2>&1; then
+  echo "Error: Task '$TASK_ID' already exists. Use lucy-kill first to remove it."
+  exit 1
+fi
+
+# Truncate tmux session name if too long
+if [ ${#TMUX_SESSION} -gt 80 ]; then
+  TMUX_SESSION="${TMUX_SESSION:0:80}"
+fi
+
+echo "Spawning agent: $TASK_ID"
+echo "  Repo:     ${REPO:-"(none)"}"
+echo "  Group:    $GROUP"
+echo "  Type:     $TYPE"
+echo "  Model:    $MODEL (${MODEL_MAP[$MODEL]})"
+if [ -n "$BRANCH" ]; then
+  echo "  Branch:   $BRANCH"
+  echo "  Worktree: $WORKTREE_DIR"
+fi
+echo "  tmux:     $TMUX_SESSION"
+echo "  Log:      $AGENT_LOG"
+
+if $IS_OPS; then
+  # Ops tasks: agent works in repo dir (or ~/Claude), but metadata goes to a task-specific dir
+  OPS_TASK_DIR="$LUCY_DIR/tasks/${TASK_ID}"
+  mkdir -p "$OPS_TASK_DIR"
+  WORK_DIR="${REPO_DIR:-$WORKTREE_ROOT}"
+  echo "  Work dir: $WORK_DIR (ops mode, no worktree)"
+  echo "  Task dir: $OPS_TASK_DIR (plan, done, verification files)"
+else
+  # Step 1: Fetch latest from remote
+  echo "Fetching latest from remote..."
+  git -C "$REPO_DIR" fetch origin 2>/dev/null || true
+
+  # Step 2: Determine default branch
+  DEFAULT_BRANCH=$(git -C "$REPO_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+
+  # Step 3: Create worktree
+  echo "Creating worktree..."
+  mkdir -p "$(dirname "$WORKTREE_DIR")"
+  git -C "$REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$DEFAULT_BRANCH" 2>/dev/null
+
+  WORK_DIR="$WORKTREE_DIR"
+
+  # Step 4: Install dependencies (if applicable)
+  if [ -f "$WORK_DIR/package-lock.json" ]; then
+    echo "Installing npm dependencies..."
+    (cd "$WORK_DIR" && npm install --silent 2>/dev/null) || true
+  elif [ -f "$WORK_DIR/pnpm-lock.yaml" ]; then
+    echo "Installing pnpm dependencies..."
+    (cd "$WORK_DIR" && pnpm install --silent 2>/dev/null) || true
+  elif [ -f "$WORK_DIR/yarn.lock" ]; then
+    echo "Installing yarn dependencies..."
+    (cd "$WORK_DIR" && yarn install --silent 2>/dev/null) || true
+  fi
+fi
+
+# Step 5: Assemble prompt
+# For ops tasks, metadata goes to the task dir (keeps repo clean)
+if $IS_OPS; then
+  META_DIR="$OPS_TASK_DIR"
+else
+  META_DIR="$WORK_DIR"
+fi
+PROMPT_FILE="$META_DIR/.lucy-prompt.md"
+
+{
+  echo "# Task"
+  echo ""
+  echo "**Type:** $TYPE"
+  if [ -n "$REPO" ]; then
+    echo "**Repository:** $REPO"
+  fi
+  if [ -n "$BRANCH" ]; then
+    echo "**Branch:** $BRANCH"
+  fi
+  echo ""
+  echo "## Description"
+  echo ""
+  echo "$DESC"
+  echo ""
+
+  # Include issue body if provided
+  if [ -n "$ISSUE" ]; then
+    echo "## GitHub Issue #$ISSUE"
+    echo ""
+    GH_REMOTE=""
+    if [ -n "$REPO" ] && [ -d "$REPO_DIR/.git" ]; then
+      GH_REMOTE=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | sed 's/.*github.com[:/]\(.*\)/\1/')
+    fi
+    if [ -n "$GH_REMOTE" ]; then
+      gh issue view "$ISSUE" --repo "$GH_REMOTE" --json body --jq '.body' 2>/dev/null || echo "(Could not fetch issue body)"
+    fi
+    echo ""
+  fi
+
+  # Include template if it exists
+  TEMPLATE_FILE="$LUCY_DIR/templates/${TYPE}.md"
+  if [ -f "$TEMPLATE_FILE" ]; then
+    echo "## Task Guidelines"
+    echo ""
+    cat "$TEMPLATE_FILE"
+    echo ""
+  fi
+
+  # Include context files if specified
+  if [ ${#CONTEXT_FILES[@]} -gt 0 ]; then
+    echo "## Business Context"
+    echo ""
+    for CTX in "${CONTEXT_FILES[@]}"; do
+      CTX_FILE="$LUCY_DIR/context/$CTX"
+      if [ -f "$CTX_FILE" ]; then
+        cat "$CTX_FILE"
+        echo ""
+      else
+        echo "(Warning: context file '$CTX' not found)"
+        echo ""
+      fi
+    done
+  fi
+
+  # For ops tasks, tell the agent where metadata files go
+  if $IS_OPS; then
+    echo "## Metadata Directory"
+    echo ""
+    echo "Write all Lucy metadata files (.lucy-plan.md, .lucy-done.md, .lucy-stuck.md) to:"
+    echo "\`$OPS_TASK_DIR/\`"
+    echo ""
+    echo "Do NOT write .lucy-* files in the working directory. The task directory is separate so the repo stays clean."
+    echo ""
+  fi
+
+  # Include AGENTS.md
+  echo "---"
+  echo ""
+  cat "$LUCY_DIR/AGENTS.md"
+
+} > "$PROMPT_FILE"
+
+echo "Prompt assembled ($(wc -l < "$PROMPT_FILE") lines)"
+
+# Step 6: Use shared Chrome instance (isolated sessions disabled to conserve memory)
+# Each isolated Chrome process uses 200-500MB; at scale this causes OOM crashes.
+# Agents share port 9222 with tab isolation handled by chrome-tabs system.
+CHROME_PORT="9222"
+echo "  Chrome: shared instance (port $CHROME_PORT)"
+
+# Step 7: Create tmux session and launch agent with output logging
+echo "Launching agent in tmux..."
+mkdir -p "$LUCY_DIR/logs"
+
+AGENT="${AGENT_BIN[$MODEL]}"
+MODEL_ID="${MODEL_MAP[$MODEL]}"
+# For ops tasks, prompt is in the task dir, not the working dir
+if $IS_OPS; then
+  PROMPT_REF="$OPS_TASK_DIR/.lucy-prompt.md"
+else
+  PROMPT_REF=".lucy-prompt.md"
+fi
+AGENT_CMD=$(build_agent_cmd "$AGENT" "$MODEL_ID" "$PROMPT_REF" "$AGENT_LOG")
+
+tmux new-session -d -s "$TMUX_SESSION" -c "$WORK_DIR"
+# Source .bashrc for env vars (bypasses non-interactive guard), then set Chrome port
+tmux send-keys -t "$TMUX_SESSION" "source <(grep -v 'case \$- in' ~/.bashrc | grep -v '\\*i\\*' | grep -v 'return;;' | grep -v 'esac') 2>/dev/null; export CHROME_DEBUG_PORT=$CHROME_PORT && export WSLENV=\"\${WSLENV:+\$WSLENV:}CHROME_DEBUG_PORT\"" Enter
+# Pass OPENAI_API_KEY for Codex/OpenAI agents
+if [ -n "${OPENAI_API_KEY:-}" ] && [[ "$AGENT" == "codex" ]]; then
+  tmux send-keys -t "$TMUX_SESSION" "export OPENAI_API_KEY='$OPENAI_API_KEY'" Enter
+fi
+tmux send-keys -t "$TMUX_SESSION" "$AGENT_CMD" Enter
+
+# Step 8: Register in tasks.json
+NOW=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+# Record which tmux session spawned this task (for cascade cleanup on terminal close)
+PARENT_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
+read_tasks | jq ". + [{
+  \"id\": \"$TASK_ID\",
+  \"repo\": \"$REPO\",
+  \"group\": \"$GROUP\",
+  \"description\": $(echo "$DESC" | jq -Rs .),
+  \"type\": \"$TYPE\",
+  \"model\": \"$MODEL\",
+  \"tmux\": \"$TMUX_SESSION\",
+  \"worktree\": \"${WORKTREE_DIR:-${OPS_TASK_DIR:-$WORK_DIR}}\",
+  \"branch\": \"${BRANCH:-}\",
+  \"status\": \"running\",
+  \"spawned_at\": \"$NOW\",
+  \"retries\": 0,
+  \"max_retries\": $MAX_R,
+  \"pr\": null,
+  \"log\": \"$AGENT_LOG\",
+  \"chrome_port\": ${CHROME_PORT:-null},
+  \"parent_session\": \"$PARENT_SESSION\",
+  \"checks\": {
+    \"ci\": null,
+    \"review_codex\": null,
+    \"review_gemini\": null,
+    \"review_claude\": null
+  },
+  \"notified\": false
+}]" | write_tasks
+
+# Step 9: Notify
+# No push notification for spawn (orchestrator handles awareness)
+log "SPAWN $TASK_ID repo=$REPO model=$MODEL type=$TYPE group=$GROUP"
+
+echo ""
+echo "Agent spawned successfully."
+echo "  Attach:  tmux attach -t $TMUX_SESSION"
+echo "  Tail:    tail -f $AGENT_LOG"
+echo "  Status:  lucy-status"
+echo "  Kill:    lucy-kill $TASK_ID"
+
+# Step 10: Auto-start orchestrator if not already running
+if ! tmux has-session -t "lucy-orch" 2>/dev/null; then
+  "$SCRIPT_DIR/lucy-orchestrate" --detach 2>/dev/null || true
+  echo ""
+  echo "Orchestrator auto-started (opus, tmux session: lucy-orch)"
+else
+  echo ""
+  echo "Orchestrator already running."
+fi
+echo "Dashboard: http://$(hostname -I 2>/dev/null | awk '{print $1}'):3100"

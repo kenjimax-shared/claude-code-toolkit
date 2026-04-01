@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Lucy Dashboard: Launch the web dashboard on port 3100
+set -euo pipefail
+
+DASHBOARD_DIR="$HOME/.claude/lucy/dashboard"
+VENV="$DASHBOARD_DIR/.venv"
+
+if [[ ! -d "$VENV" ]]; then
+    echo "Error: venv not found at $VENV. Run: cd $DASHBOARD_DIR && uv venv .venv && uv pip install fastapi uvicorn jinja2"
+    exit 1
+fi
+
+cd "$DASHBOARD_DIR"
+exec "$VENV/bin/python" -m uvicorn app:app --host 0.0.0.0 --port 3100 --log-level info

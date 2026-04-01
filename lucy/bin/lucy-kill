@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# lucy-kill: Stop an agent gracefully and clean up
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-kill <task-id> [--clean]"
+  echo ""
+  echo "Options:"
+  echo "  --clean    Also remove worktree and branch"
+  echo ""
+  echo "Active tasks:"
+  read_tasks | jq -r '.[] | select(.status == "running" or .status == "pr_open" or .status == "reviewing") | "  \(.id) (\(.status))"'
+  exit 1
+fi
+
+TASK_ID="$1"
+CLEAN=false
+if [ "${2:-}" = "--clean" ]; then
+  CLEAN=true
+fi
+
+# Get task info
+TASK=$(get_task "$TASK_ID")
+if [ -z "$TASK" ]; then
+  echo "Error: Task '$TASK_ID' not found"
+  exit 1
+fi
+
+TMUX_SESSION=$(echo "$TASK" | jq -r '.tmux')
+WORKTREE=$(echo "$TASK" | jq -r '.worktree')
+BRANCH=$(echo "$TASK" | jq -r '.branch')
+REPO=$(echo "$TASK" | jq -r '.repo')
+REPO_DIR="$WORKTREE_ROOT/$REPO"
+
+# Kill tmux session
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "Killing tmux session: $TMUX_SESSION"
+  tmux kill-session -t "$TMUX_SESSION"
+else
+  echo "tmux session '$TMUX_SESSION' not found (already dead)"
+fi
+
+# Stop isolated Chrome session (merge data back to base, then clean up)
+echo "Stopping Chrome session: $TASK_ID"
+"$LUCY_BIN/chrome-session" stop "$TASK_ID" --merge 2>/dev/null || true
+
+# Update status
+update_task "$TASK_ID" "status" '"killed"'
+echo "Task status set to 'killed'"
+
+# Clean up worktree and branch if requested
+if $CLEAN; then
+  if [ -d "$WORKTREE" ]; then
+    echo "Removing worktree: $WORKTREE"
+    git -C "$REPO_DIR" worktree remove "$WORKTREE" --force 2>/dev/null || rm -rf "$WORKTREE"
+  fi
+  echo "Deleting branch: $BRANCH"
+  git -C "$REPO_DIR" branch -D "$BRANCH" 2>/dev/null || true
+  echo "Cleanup complete"
+fi
+
+log "KILL $TASK_ID clean=$CLEAN"
+# No push notification for user-initiated kill
+
+echo "Done."

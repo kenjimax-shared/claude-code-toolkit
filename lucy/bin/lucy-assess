@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+# lucy-assess: Periodic one-shot orchestrator assessment
+# Gathers all agent state, calls Claude (one-shot) for intelligent assessment,
+# writes structured JSON to assessments files, and executes corrections.
+#
+# Run via cron every 5 minutes: */5 * * * * ~/.claude/lucy/bin/lucy-assess
+# Or run continuously:          lucy-assess --loop [--interval 300]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+# ── Args ──────────────────────────────────────────────────────────────
+LOOP=false
+INTERVAL=300  # seconds between cycles in loop mode
+MODEL="opus"
+VERBOSE=false
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --loop)      LOOP=true; shift ;;
+    --interval)  INTERVAL="$2"; shift 2 ;;
+    --model)     MODEL="$2"; shift 2 ;;
+    --verbose)   VERBOSE=true; shift ;;
+    --dry-run)   DRY_RUN=true; shift ;;
+    -h|--help)
+      echo "Usage: lucy-assess [--loop] [--interval <secs>] [--model haiku|sonnet] [--verbose] [--dry-run]"
+      echo ""
+      echo "Runs one orchestrator assessment cycle (or loops continuously)."
+      echo "Reads all agent state, calls Claude for assessment, writes results,"
+      echo "and executes corrections (redirects stuck agents, flags bad assumptions)."
+      echo ""
+      echo "Options:"
+      echo "  --loop           Run continuously (default: single cycle for cron)"
+      echo "  --interval <s>   Seconds between cycles in loop mode (default: 300)"
+      echo "  --model <m>      Model for assessment (default: haiku, use sonnet for deeper analysis)"
+      echo "  --verbose        Print assessment to stdout"
+      echo "  --dry-run        Print prompt but don't call Claude or write files"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+MODEL_ID="${MODEL_MAP[$MODEL]:-claude-haiku-4-5}"
+
+# ── Lock (flock-based, no stale lock risk) ────────────────────────────
+LOCK_FILE="$LUCY_DIR/.assess.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "ASSESS skipped: another assessment running"
+  exit 0
+fi
+# Lock held via fd 9 for process lifetime; auto-released on exit
+
+# ── Inbox (message queue for dashboard chat) ─────────────────────────
+INBOX_FILE="$LUCY_DIR/inbox.jsonl"
+CHAT_LOG="$LUCY_DIR/chat-log.jsonl"
+INBOX_PROCESSING="$LUCY_DIR/.inbox.processing.jsonl"
+FEED_FILE="$LUCY_DIR/orchestrator-feed.jsonl"
+
+# Write a structured entry to the orchestrator feed (visible on dashboard)
+feed_write() {
+  local type="$1" msg="$2" task="${3:-}"
+  local ts
+  ts=$(date '+%H:%M:%S')
+  if [ -n "$task" ]; then
+    jq -nc --arg ts "$ts" --arg type "$type" --arg task "$task" --arg msg "$msg" \
+      '{ts:$ts,type:$type,task:$task,msg:$msg}' >> "$FEED_FILE"
+  else
+    jq -nc --arg ts "$ts" --arg type "$type" --arg msg "$msg" \
+      '{ts:$ts,type:$type,msg:$msg}' >> "$FEED_FILE"
+  fi
+  # Trim to last 200 entries when it grows too large
+  local lines
+  lines=$(wc -l < "$FEED_FILE" 2>/dev/null || echo 0)
+  if [ "$lines" -gt 300 ]; then
+    tail -200 "$FEED_FILE" > "$FEED_FILE.tmp" && mv "$FEED_FILE.tmp" "$FEED_FILE"
+  fi
+}
+
+claim_inbox() {
+  # Atomically claim pending messages (mv is atomic on Linux)
+  if [ -s "$INBOX_FILE" ]; then
+    mv "$INBOX_FILE" "$INBOX_PROCESSING" 2>/dev/null || true
+    touch "$INBOX_FILE"
+    cat "$INBOX_PROCESSING" 2>/dev/null
+  fi
+}
+
+write_chat_responses() {
+  local responses="$1"
+  if [ -z "$responses" ] || [ "$responses" = "null" ] || [ "$responses" = "[]" ]; then
+    rm -f "$INBOX_PROCESSING"
+    return
+  fi
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  echo "$responses" | jq -c ".[] | . + {ts: \"$ts\", role: \"lucy\"}" 2>/dev/null >> "$CHAT_LOG"
+  rm -f "$INBOX_PROCESSING"
+  local count
+  count=$(echo "$responses" | jq 'length' 2>/dev/null || echo 0)
+  log "ASSESS wrote $count chat response(s)"
+}
+
+requeue_inbox() {
+  # On failure after claiming, put messages back so they're not lost
+  if [ -f "$INBOX_PROCESSING" ] && [ -s "$INBOX_PROCESSING" ]; then
+    if [ -s "$INBOX_FILE" ]; then
+      # Prepend claimed messages (they arrived first)
+      cat "$INBOX_FILE" >> "$INBOX_PROCESSING"
+    fi
+    mv "$INBOX_PROCESSING" "$INBOX_FILE"
+    log "ASSESS re-queued inbox messages after failure"
+  else
+    rm -f "$INBOX_PROCESSING"
+  fi
+}
+
+# ── Gather state ──────────────────────────────────────────────────────
+gather_state() {
+  local tasks
+  tasks=$(read_tasks)
+  local count
+  count=$(echo "$tasks" | jq 'length')
+
+  if [ "$count" -eq 0 ]; then
+    echo ""
+    return
+  fi
+
+  # Split into active (need assessment) and terminal (just list)
+  local active terminal
+  active=$(echo "$tasks" | jq '[.[] | select(.status == "running" or .status == "stuck" or .status == "reviewing" or .status == "verifying" or .status == "pr_open")]')
+  terminal=$(echo "$tasks" | jq '[.[] | select(.status == "ready" or .status == "merged" or .status == "failed" or .status == "killed")]')
+  local active_count terminal_count
+  active_count=$(echo "$active" | jq 'length')
+  terminal_count=$(echo "$terminal" | jq 'length')
+
+  echo "# Lucy Agent State ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+  echo ""
+  echo "Total: $count tasks ($active_count active, $terminal_count completed/failed)"
+  echo ""
+
+  # Terminal tasks: one-liner each
+  if [ "$terminal_count" -gt 0 ]; then
+    echo "## Completed/Terminal Tasks"
+    echo "$terminal" | jq -r '.[] | "- \(.id): \(.status)\(.pr // "" | if . != "" then " PR #\(.)" else "" end)"'
+    echo ""
+  fi
+
+  # Active tasks: full detail
+  if [ "$active_count" -eq 0 ]; then
+    echo "## No active tasks requiring assessment."
+    return
+  fi
+
+  echo "## Active Tasks (need assessment)"
+  echo ""
+
+  echo "$active" | jq -c '.[]' | while IFS= read -r task; do
+    local id status model group desc type retries tmux_name worktree
+    id=$(echo "$task" | jq -r '.id')
+    status=$(echo "$task" | jq -r '.status')
+    model=$(echo "$task" | jq -r '.model')
+    group=$(echo "$task" | jq -r '.group // "default"')
+    desc=$(echo "$task" | jq -r '.description' | head -2 | tr '\n' ' ' | cut -c1-150)
+    type=$(echo "$task" | jq -r '.type // "feature"')
+    retries=$(echo "$task" | jq -r '.retries')
+    tmux_name=$(echo "$task" | jq -r '.tmux')
+    worktree=$(echo "$task" | jq -r '.worktree')
+    local pr
+    pr=$(echo "$task" | jq -r '.pr // empty')
+
+    # Check tmux alive
+    local alive="dead"
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+      alive="alive"
+    fi
+
+    echo "### $id"
+    echo "- **Status:** $status | **tmux:** $alive | **Model:** $model | **Group:** $group | **Type:** $type | **Retries:** $retries"
+    [ -n "$pr" ] && echo "- **PR:** #$pr"
+    echo "- **Description:** $desc"
+
+    # Read plan: prioritize living document sections (Progress, Decisions, Surprises)
+    # These give better signal than the static Assumptions/Criteria sections
+    local plan_file=""
+    if [ -f "$LUCY_DIR/tasks/${id}/.lucy-plan.md" ]; then
+      plan_file="$LUCY_DIR/tasks/${id}/.lucy-plan.md"
+    elif [ -n "$worktree" ] && [ -f "$worktree/.lucy-plan.md" ]; then
+      plan_file="$worktree/.lucy-plan.md"
+    fi
+    if [ -n "$plan_file" ]; then
+      # Extract Progress section (most valuable for assessment)
+      local progress
+      progress=$(sed -n '/^## Progress/,/^## /{ /^## Progress/d; /^## /d; p; }' "$plan_file" 2>/dev/null | head -20)
+      # Extract Decision Log
+      local decisions
+      decisions=$(sed -n '/^## Decision Log/,/^## /{ /^## Decision Log/d; /^## /d; p; }' "$plan_file" 2>/dev/null | head -15)
+      # Extract Surprises & Discoveries
+      local surprises
+      surprises=$(sed -n '/^## Surprises/,/^## /{ /^## Surprises/d; /^## /d; p; }' "$plan_file" 2>/dev/null | head -10)
+
+      # If living sections exist, show them prominently; otherwise fall back to head
+      if [ -n "$progress" ] || [ -n "$decisions" ] || [ -n "$surprises" ]; then
+        # Always show criteria (compact, first 10 lines)
+        echo "- **Acceptance Criteria:**"
+        echo '```'
+        sed -n '/^## Acceptance Criteria/,/^## /{ /^## Acceptance Criteria/d; /^## /d; p; }' "$plan_file" 2>/dev/null | head -10
+        echo '```'
+        if [ -n "$progress" ]; then
+          echo "- **Progress (live):**"
+          echo '```'
+          echo "$progress"
+          echo '```'
+        fi
+        if [ -n "$decisions" ]; then
+          echo "- **Decision Log:**"
+          echo '```'
+          echo "$decisions"
+          echo '```'
+        fi
+        if [ -n "$surprises" ]; then
+          echo "- **Surprises:**"
+          echo '```'
+          echo "$surprises"
+          echo '```'
+        fi
+      else
+        # Legacy plan format (no living sections): show top 30 lines
+        echo "- **Plan:**"
+        echo '```'
+        head -30 "$plan_file"
+        echo '```'
+      fi
+    fi
+
+    # Read stuck file if exists
+    local stuck_file=""
+    if [ -f "$LUCY_DIR/tasks/${id}/.lucy-stuck.md" ]; then
+      stuck_file="$LUCY_DIR/tasks/${id}/.lucy-stuck.md"
+    elif [ -n "$worktree" ] && [ -f "$worktree/.lucy-stuck.md" ]; then
+      stuck_file="$worktree/.lucy-stuck.md"
+    fi
+    if [ -n "$stuck_file" ]; then
+      echo "- **STUCK:**"
+      echo '```'
+      head -15 "$stuck_file"
+      echo '```'
+    fi
+
+    # Recent agent activity from log (last 8 meaningful lines)
+    local log_file
+    log_file=$(echo "$task" | jq -r '.log // empty')
+    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+      local activity
+      activity=$(tail -n 100 "$log_file" | while IFS= read -r line; do
+        local ltype
+        ltype=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+        case "$ltype" in
+          assistant)
+            echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text' 2>/dev/null | head -c 200
+            echo "$line" | jq -r '.message.content[]? | select(.type == "tool_use") | "[TOOL] \(.name)"' 2>/dev/null
+            ;;
+        esac
+      done | grep -v '^$' | tail -8)
+      if [ -n "$activity" ]; then
+        echo "- **Recent activity:**"
+        echo '```'
+        echo "$activity"
+        echo '```'
+      fi
+    fi
+
+    # Live tmux pane snapshot (if alive and running)
+    if [ "$alive" = "alive" ] && [ "$status" = "running" ]; then
+      local pane
+      pane=$(tmux capture-pane -t "$tmux_name" -p -S -8 2>/dev/null | tail -8 | head -c 400)
+      if [ -n "$pane" ]; then
+        echo "- **Live pane:**"
+        echo '```'
+        echo "$pane"
+        echo '```'
+      fi
+    fi
+
+    echo ""
+  done
+}
+
+# ── Gather business context for active groups ────────────────────────
+gather_context() {
+  local tasks
+  tasks=$(read_tasks)
+
+  # Find unique groups with active tasks
+  local active_groups
+  active_groups=$(echo "$tasks" | jq -r '[.[] | select(.status == "running" or .status == "stuck" or .status == "reviewing" or .status == "verifying" or .status == "pr_open") | .group // "default"] | unique | .[]')
+
+  if [ -z "$active_groups" ]; then
+    return
+  fi
+
+  echo "# Business Context"
+  echo ""
+  echo "You are managing agents across these businesses/projects. Use this context to judge whether agents are making correct decisions."
+  echo ""
+
+  # Always include shared conventions and tools/access knowledge
+  local shared_file="$LUCY_DIR/context/shared.md"
+  if [ -f "$shared_file" ]; then
+    cat "$shared_file"
+    echo ""
+  fi
+  local tools_file="$LUCY_DIR/context/tools-and-access.md"
+  if [ -f "$tools_file" ]; then
+    cat "$tools_file"
+    echo ""
+  fi
+
+  # Map group names to context files
+  for grp in $active_groups; do
+    case "$grp" in
+      myproject)
+        # Include all myproject context modules
+        for f in "$LUCY_DIR/context"/myproject*.md; do
+          [ -f "$f" ] && cat "$f" && echo ""
+        done
+        ;;
+      client1)   [ -f "$LUCY_DIR/context/client1.md" ] && cat "$LUCY_DIR/context/client1.md" && echo "" ;;
+      client2)    [ -f "$LUCY_DIR/context/client2.md" ] && cat "$LUCY_DIR/context/client2.md" && echo "" ;;
+      client3)      [ -f "$LUCY_DIR/context/client3.md" ] && cat "$LUCY_DIR/context/client3.md" && echo "" ;;
+      agency) [ -f "$LUCY_DIR/context/agency.md" ] && cat "$LUCY_DIR/context/agency.md" && echo "" ;;
+      client4) [ -f "$LUCY_DIR/context/client4.md" ] && cat "$LUCY_DIR/context/client4.md" && echo "" ;;
+      client5) [ -f "$LUCY_DIR/context/client5.md" ] && cat "$LUCY_DIR/context/client5.md" && echo "" ;;
+      client6) [ -f "$LUCY_DIR/context/client6.md" ] && cat "$LUCY_DIR/context/client6.md" && echo "" ;;
+      client7)    [ -f "$LUCY_DIR/context/client7.md" ] && cat "$LUCY_DIR/context/client7.md" && echo "" ;;
+      client8) [ -f "$LUCY_DIR/context/client8.md" ] && cat "$LUCY_DIR/context/client8.md" && echo "" ;;
+      personal)  ;; # No business context for personal projects
+      default)
+        # For unknown groups, include shared only (already done above)
+        ;;
+    esac
+  done
+}
+
+# ── Build assessment prompt ───────────────────────────────────────────
+build_prompt() {
+  local state="$1"
+  local context="$2"
+  local messages="${3:-}"
+
+  cat <<'PROMPT_HEADER'
+You are Lucy, an AI engineering manager overseeing autonomous coding and ops agents. Your job is to assess each agent's status, catch bad decisions early, and take corrective action.
+
+Review the agent state below and produce a JSON assessment. Be direct and opinionated.
+
+For each agent, evaluate:
+1. **Is it on track?** Check if its approach makes sense for the task.
+2. **Are its assumptions correct?** Flag any that seem wrong or risky.
+3. **Is it making good decisions?** Flag questionable tool choices, approaches, or patterns.
+4. **Is it stuck or looping?** Detect if it's retrying the same thing or making no progress.
+5. **Does it need user input?** Some decisions only the human can make.
+6. **Is it blocked by an access gate it could bypass?** See below.
+
+## Access Gate Detection (CRITICAL)
+
+Agents often hit auth gates and give up. You MUST detect these patterns and redirect:
+
+**Patterns to watch for:**
+- "Sign in to see this page" (Notion, Google Docs, etc.)
+- "403 Forbidden" or "401 Unauthorized" on services we have credentials for
+- "Could not fetch" or "access denied" when the service has an API token or browser profile
+- Agent saying it "cannot verify" something because a page is auth-gated
+
+**Available access methods agents should use:**
+- `pp <service>` (Proton Pass CLI): Look up any stored password, TOTP code, or credential
+- `agent-browser`: Persistent browser profiles with saved logins for: zapier-myproject, gtm, nextdoor, qbo
+- API tokens in environment: ZENDESK_SUPPORT_TOKEN, ZENDESK_SELL_TOKEN, CALLRAIL_API_KEY
+- `gh` CLI for GitHub (pre-authenticated)
+- `bq` CLI for BigQuery (project: myproject-cac)
+- For Notion: use `pp notion -a` to get credentials, then `agent-browser` to read pages
+
+**When you detect an auth-gate block:**
+Issue a `redirect` intervention telling the agent exactly how to access the content. Example:
+"You hit a Notion auth gate. Use: pp notion -a to get credentials, then agent-browser to open and read the page. Save content to a local file for processing."
+
+Do NOT let agents mark something as "could not verify" when we have credentials for that service.
+
+IMPORTANT: Output ONLY valid JSON matching this schema (no markdown, no backticks, just raw JSON):
+
+{
+  "timestamp": "ISO 8601",
+  "summary": "1-2 sentence overall status for the dashboard",
+  "needs_input": [{"item": "what needs human decision", "severity": "info|warning|critical"}],
+  "interventions": [
+    {
+      "task_id": "the-task-id",
+      "action": "redirect|kill|flag",
+      "severity": "info|warning|critical",
+      "message": "what to tell the agent or the user"
+    }
+  ],
+  "assessments": {
+    "task-id-here": {
+      "verdict": "on-track|drifting|stuck|blocked|done|needs-input",
+      "summary": "1 sentence status",
+      "key_decisions": ["notable decisions the agent made"],
+      "assumptions_flagged": ["assumptions that look wrong or risky"],
+      "risks": ["things that could go wrong"],
+      "recommendation": "what the orchestrator should do, if anything"
+    }
+  },
+  "chat_responses": [
+    {"message": "your response to the user's inbox message (include ONLY if inbox messages were sent)"}
+  ]
+}
+
+Verdict meanings:
+- on-track: Agent is progressing well, no issues
+- drifting: Agent is working but its approach may not be optimal
+- stuck: Agent is looping or making no progress
+- blocked: Agent hit an external dependency it can't resolve
+- done: Agent completed its task
+- needs-input: A decision only the human can make
+
+Severity meanings (for interventions and needs_input):
+- info: Routine observation, logged but no notification (e.g. redirect, minor flag)
+- warning: Notable issue that may need attention soon (e.g. drifting agent, questionable assumption)
+- critical: Requires immediate human attention (e.g. security issue, data loss risk, all agents stuck, agent doing something destructive). The user ONLY gets notified for critical items, so reserve this for things that truly cannot wait.
+
+PROMPT_HEADER
+
+  # Inbox messages from the user/dashboard
+  if [ -n "$messages" ]; then
+    echo ""
+    echo "---"
+    echo ""
+    echo "## Inbox Messages"
+    echo "The user sent these messages to you via the dashboard. Respond to EACH in the chat_responses array."
+    echo ""
+    echo "$messages" | while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local msg_ts msg_text
+      msg_ts=$(echo "$line" | jq -r '.ts // "?"' 2>/dev/null)
+      msg_text=$(echo "$line" | jq -r '.text // .message // "?"' 2>/dev/null)
+      echo "- [$msg_ts] user: $msg_text"
+    done
+    echo ""
+  fi
+
+  # Business context (so the orchestrator knows the business)
+  if [ -n "$context" ]; then
+    echo ""
+    echo "---"
+    echo ""
+    echo "$context"
+  fi
+
+  # Agent state
+  echo ""
+  echo "---"
+  echo ""
+  if [ -n "$state" ]; then
+    echo "$state"
+  else
+    echo "# Agent State"
+    echo ""
+    echo "No tasks registered. No agents are currently running."
+  fi
+}
+
+# ── Execute one assessment cycle ──────────────────────────────────────
+run_cycle() {
+  log "ASSESS cycle starting (model=$MODEL)"
+
+  # Claim inbox messages (atomic: moves inbox to processing file)
+  local inbox_messages=""
+  inbox_messages=$(claim_inbox)
+
+  # Gather state and context
+  local state
+  state=$(gather_state)
+
+  if [ -z "$state" ] && [ -z "$inbox_messages" ]; then
+    log "ASSESS skipped: no active tasks and no inbox messages"
+    rm -f "$INBOX_PROCESSING"
+    return
+  fi
+
+  # Count what we're assessing
+  local active_count=0
+  active_count=$(read_tasks | jq '[.[] | select(.status == "running" or .status == "stuck" or .status == "reviewing" or .status == "verifying" or .status == "pr_open")] | length' 2>/dev/null || echo 0)
+  local inbox_count=0
+  [ -n "$inbox_messages" ] && inbox_count=$(echo "$inbox_messages" | wc -l)
+  feed_write "scan" "Assessment starting (model=$MODEL): $active_count active agents, $inbox_count inbox messages"
+
+  local context
+  context=$(gather_context)
+
+  local prompt
+  prompt=$(build_prompt "$state" "$context" "$inbox_messages")
+
+  if $DRY_RUN; then
+    echo "=== DRY RUN: Assessment Prompt ==="
+    echo "$prompt"
+    echo "=== END ==="
+    return
+  fi
+
+  # Call Claude one-shot from a clean directory (avoids loading heavy CLAUDE.md/MEMORY.md)
+  local assess_dir="$LUCY_DIR/orchestrator"
+  mkdir -p "$assess_dir"
+  local response
+  local prompt_file="$assess_dir/.assess-prompt.txt"
+  echo "$prompt" > "$prompt_file"
+  feed_write "scan" "Calling Claude ($MODEL_ID) for assessment..."
+  response=$(cd "$assess_dir" && claude --model "$MODEL_ID" --dangerously-skip-permissions --setting-sources "" -p "$(cat "$prompt_file")" 2>/dev/null) || {
+    log "ASSESS error: claude call failed"
+    feed_write "error" "Claude API call failed"
+    requeue_inbox
+    return
+  }
+
+  # Extract JSON from response (Claude might wrap it in markdown code fences)
+  local json_response
+  json_response=$(echo "$response" | python3 -c "
+import sys, json, re
+text = sys.stdin.read()
+text = re.sub(r'^\`\`\`json\s*', '', text, flags=re.MULTILINE)
+text = re.sub(r'^\`\`\`\s*$', '', text, flags=re.MULTILINE)
+start = text.find('{')
+end = text.rfind('}')
+if start >= 0 and end > start:
+    candidate = text[start:end+1]
+    try:
+        json.loads(candidate)
+        print(candidate)
+    except json.JSONDecodeError:
+        pass
+" 2>/dev/null)
+
+  # Validate JSON
+  if [ -z "$json_response" ] || ! echo "$json_response" | jq . >/dev/null 2>&1; then
+    log "ASSESS error: invalid JSON response"
+    if $VERBOSE; then
+      echo "Raw response:"
+      echo "$response" | head -50
+    fi
+    requeue_inbox
+    return
+  fi
+
+  if $VERBOSE; then
+    echo "$json_response" | jq .
+  fi
+
+  # Write per-task verdicts and flags to the orchestrator feed
+  echo "$json_response" | jq -r '.assessments | to_entries[] | "\(.key)\t\(.value.verdict // "?")\t\(.value.summary // "")"' 2>/dev/null | while IFS=$'\t' read -r tid verdict summary; do
+    feed_write "verdict" "$verdict: $summary" "$tid"
+  done
+  echo "$json_response" | jq -r '.assessments | to_entries[] | .key as $tid | (.value.assumptions_flagged // [])[] | "\($tid)\t\(.)"' 2>/dev/null | while IFS=$'\t' read -r tid assumption; do
+    feed_write "flag" "Flagged assumption: $assumption" "$tid"
+  done
+  echo "$json_response" | jq -r '.needs_input // [] | .[] | if type == "object" then "[\(.severity // "info")] \(.item // "")" else . end' 2>/dev/null | while IFS= read -r item; do
+    feed_write "needs_input" "$item"
+  done
+
+  # Write assessments per group
+  local tasks
+  tasks=$(read_tasks)
+  local groups
+  groups=$(echo "$tasks" | jq -r '[.[] | .group // "default"] | unique | .[]')
+
+  for grp in $groups; do
+    local group_file="$LUCY_DIR/assessments-${grp}.json"
+    # Filter assessments for this group's tasks
+    local group_task_ids
+    group_task_ids=$(echo "$tasks" | jq -r ".[] | select((.group // \"default\") == \"$grp\") | .id")
+
+    local group_assessments="{}"
+    for tid in $group_task_ids; do
+      local task_assess
+      task_assess=$(echo "$json_response" | jq -r ".assessments.\"$tid\" // empty" 2>/dev/null)
+      if [ -n "$task_assess" ]; then
+        group_assessments=$(echo "$group_assessments" | jq --arg k "$tid" --argjson v "$task_assess" '. + {($k): $v}')
+      fi
+    done
+
+    # Build group assessment file
+    local timestamp
+    timestamp=$(echo "$json_response" | jq -r '.timestamp // empty')
+    [ -z "$timestamp" ] && timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local summary
+    summary=$(echo "$json_response" | jq -r '.summary // ""')
+    local needs_input
+    needs_input=$(echo "$json_response" | jq '.needs_input // []')
+    local interventions
+    local group_ids_json
+    group_ids_json=$(echo "$group_task_ids" | jq -R -s 'split("\n") | map(select(length > 0))')
+    interventions=$(echo "$json_response" | jq --argjson ids "$group_ids_json" '[.interventions // [] | .[] | select(.task_id as $tid | $ids | index($tid))]' 2>/dev/null || echo "[]")
+
+    jq -n \
+      --arg ts "$timestamp" \
+      --arg sum "$summary" \
+      --argjson ni "$needs_input" \
+      --argjson iv "$interventions" \
+      --argjson assess "$group_assessments" \
+      '{timestamp: $ts, summary: $sum, needs_input: $ni, interventions: $iv, assessments: $assess}' \
+      > "$group_file"
+
+    log "ASSESS wrote $group_file"
+  done
+
+  # Also write the legacy assessments.json for backward compat
+  echo "$json_response" > "$LUCY_DIR/assessments.json"
+
+  # ── Execute interventions ─────────────────────────────────────────
+  local intervention_count
+  intervention_count=$(echo "$json_response" | jq '[.interventions // [] | .[]] | length')
+
+  if [ "$intervention_count" -gt 0 ]; then
+    echo "$json_response" | jq -c '.interventions[]' | while IFS= read -r intervention; do
+      local task_id action message
+      task_id=$(echo "$intervention" | jq -r '.task_id')
+      action=$(echo "$intervention" | jq -r '.action')
+      message=$(echo "$intervention" | jq -r '.message')
+
+      local severity
+      severity=$(echo "$intervention" | jq -r '.severity // "info"')
+
+      case "$action" in
+        redirect)
+          log "ASSESS intervention: redirecting $task_id"
+          feed_write "intervention" "[$severity] Redirecting: $message" "$task_id"
+          # If redirect is auth-related, append full tools-and-access reference
+          local redirect_msg="$message"
+          if echo "$message" | grep -qiE 'auth|sign.in|login|credential|password|notion|403|401|access.denied|pp |agent-browser'; then
+            local tools_ref="$LUCY_DIR/context/tools-and-access.md"
+            if [ -f "$tools_ref" ]; then
+              redirect_msg="$message
+
+--- TOOLS & ACCESS REFERENCE ---
+$(cat "$tools_ref")"
+            fi
+          fi
+          "$SCRIPT_DIR/lucy-redirect" "$task_id" "$redirect_msg" 2>/dev/null || true
+          ;;
+        kill)
+          log "ASSESS intervention: killing $task_id"
+          feed_write "intervention" "[$severity] Killing agent: $message" "$task_id"
+          "$SCRIPT_DIR/lucy-kill" "$task_id" 2>/dev/null || true
+          ;;
+        flag)
+          log "ASSESS intervention: flagging $task_id: $message"
+          feed_write "intervention" "[$severity] Flagged: $message" "$task_id"
+          ;;
+      esac
+
+      # Only notify the user for critical severity
+      if [ "$severity" = "critical" ]; then
+        curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy+CRITICAL&message=$(echo "$message" | head -c 100 | jq -sRr @uri)" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+
+  # ── Notify only for critical needs_input items ──────────────────
+  local needs_count
+  needs_count=$(echo "$json_response" | jq '[.needs_input // [] | .[]] | length')
+  local critical_needs
+  critical_needs=$(echo "$json_response" | jq '[.needs_input // [] | .[] | select((.severity // "info") == "critical")] | length' 2>/dev/null || echo 0)
+  if [ "$critical_needs" -gt 0 ]; then
+    curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy+CRITICAL" >/dev/null 2>&1 || true
+  fi
+
+  # ── Process chat responses ────────────────────────────────────────
+  if [ -n "$inbox_messages" ]; then
+    local chat_responses
+    chat_responses=$(echo "$json_response" | jq -c '.chat_responses // []' 2>/dev/null)
+    write_chat_responses "$chat_responses"
+  else
+    rm -f "$INBOX_PROCESSING"
+  fi
+
+  feed_write "complete" "Assessment done. $intervention_count interventions, $needs_count needs-input"
+  log "ASSESS cycle complete ($intervention_count interventions, $needs_count needs-input)"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+if $LOOP; then
+  log "ASSESS starting continuous loop (interval=${INTERVAL}s, model=$MODEL)"
+  echo "Lucy assess running in loop mode (every ${INTERVAL}s). Press Ctrl+C to stop."
+  while true; do
+    run_cycle || true
+    sleep "$INTERVAL"
+  done
+else
+  run_cycle
+fi

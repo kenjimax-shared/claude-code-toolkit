@@ -1,0 +1,13 @@
+*.log
+*.pid
+*.sock
+*.session
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.env
+credentials.json
+serviceaccount.json
+token.json
+*.enc

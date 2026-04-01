@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# Safe wrapper for agent-browser.
+# Prevents auth disruption by enforcing profile hygiene and session isolation.
+#
+# What it does:
+#   - Auto-adds --profile and --session-name when missing
+#   - When a session is already running (another terminal or the user), auto-creates
+#     a derivative session so the existing tab is never modified
+#   - Redirects subsequent commands to the derivative session transparently
+#   - Cleans stale Chrome SingletonLock files
+#   - Tracks terminal ownership so Stop hooks can close derivative sessions on exit
+#   - Passes all other commands through unchanged
+
+REAL="$HOME/.npm-global/bin/agent-browser"
+PROFILES="$HOME/.agent-browser/profiles"
+OWNERS="$HOME/.agent-browser/terminal-owners"
+TAG="[ab-safe]"
+
+[[ -x "$REAL" ]] || { echo "$TAG binary not found: $REAL" >&2; exit 1; }
+mkdir -p "$OWNERS"
+
+# --- Terminal identity ---
+get_terminal_id() {
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux display-message -p '#S' 2>/dev/null && return
+    fi
+    echo "pid-$$"
+}
+
+TERMINAL_ID=$(get_terminal_id)
+MAP_FILE="$OWNERS/${TERMINAL_ID}.map"
+
+# --- Derivative session mapping ---
+# Maps original session name -> derivative session name per terminal.
+# Format: original_session=derivative_session (one per line)
+get_derivative() {
+    local original="$1"
+    [[ -f "$MAP_FILE" ]] && grep -m1 "^${original}=" "$MAP_FILE" 2>/dev/null | cut -d= -f2 || echo ""
+}
+
+set_derivative() {
+    local original="$1" derivative="$2"
+    # Remove old mapping if exists, then add new
+    if [[ -f "$MAP_FILE" ]]; then
+        grep -v "^${original}=" "$MAP_FILE" > "${MAP_FILE}.tmp" 2>/dev/null
+        mv "${MAP_FILE}.tmp" "$MAP_FILE"
+    fi
+    echo "${original}=${derivative}" >> "$MAP_FILE"
+}
+
+remove_derivative() {
+    local original="$1"
+    [[ -f "$MAP_FILE" ]] || return
+    grep -v "^${original}=" "$MAP_FILE" > "${MAP_FILE}.tmp" 2>/dev/null
+    mv "${MAP_FILE}.tmp" "$MAP_FILE"
+    [[ -s "$MAP_FILE" ]] || rm -f "$MAP_FILE"
+}
+
+# --- Check if a session daemon is alive (auto-cleans stale PIDs) ---
+is_session_alive() {
+    local name="$1"
+    local pid_file="$HOME/.agent-browser/${name}.pid"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    else
+        # PID is dead — clean up the stale file so we don't create derivatives
+        rm -f "$pid_file"
+        return 1
+    fi
+}
+
+# --- Terminal ownership tracking ---
+track_ownership() {
+    local ab_session="$1"
+    local tracking_file="$OWNERS/${TERMINAL_ID}.sessions"
+    grep -qxF "$ab_session" "$tracking_file" 2>/dev/null || echo "$ab_session" >> "$tracking_file"
+}
+
+untrack_ownership() {
+    local ab_session="$1"
+    for f in "$OWNERS"/*.sessions; do
+        [[ -f "$f" ]] || continue
+        if grep -qxF "$ab_session" "$f" 2>/dev/null; then
+            grep -vxF "$ab_session" "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+            [[ -s "$f" ]] || rm -f "$f"
+        fi
+    done
+}
+
+# --- Parse arguments (read-only scan) ---
+session="" profile="" sname=""
+is_open=false
+is_close=false
+has_subcommand=false
+url_arg=""
+args=("$@")
+
+for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --session)      [[ $((i+1)) -lt ${#args[@]} ]] && session="${args[i+1]}" ;;
+        --profile)      [[ $((i+1)) -lt ${#args[@]} ]] && profile="${args[i+1]}" ;;
+        --session-name) [[ $((i+1)) -lt ${#args[@]} ]] && sname="${args[i+1]}" ;;
+        open|connect)   is_open=true; has_subcommand=true
+                        # Capture the URL that follows
+                        [[ $((i+1)) -lt ${#args[@]} ]] && url_arg="${args[i+1]}"
+                        ;;
+        close)          is_close=true; has_subcommand=true ;;
+        snapshot|click|fill|navigate|type|scroll|wait|select|hover|exec|screenshot|state)
+                        has_subcommand=true ;;
+    esac
+done
+
+# --- Redirect non-open/close commands to derivative if one exists ---
+if [[ -n "$session" ]] && $has_subcommand && ! $is_open && ! $is_close; then
+    derivative=$(get_derivative "$session")
+    if [[ -n "$derivative" ]] && is_session_alive "$derivative"; then
+        # Replace --session value with derivative in args
+        new_args=()
+        for ((i=0; i<${#args[@]}; i++)); do
+            if [[ "${args[i]}" == "--session" ]] && [[ $((i+1)) -lt ${#args[@]} ]]; then
+                new_args+=("--session" "$derivative")
+                ((i++))  # skip the original session value
+            else
+                new_args+=("${args[i]}")
+            fi
+        done
+        exec "$REAL" "${new_args[@]}"
+    fi
+fi
+
+# --- Handle 'open'/'connect' with a named session ---
+if $is_open && [[ -n "$session" ]]; then
+
+    # Check if this terminal already has a derivative for this session
+    existing_deriv=$(get_derivative "$session")
+    if [[ -n "$existing_deriv" ]] && is_session_alive "$existing_deriv"; then
+        # Reuse existing derivative: navigate it instead of creating a new one
+        echo "$TAG reusing derivative '$existing_deriv' for '$session'" >&2
+        new_args=()
+        for ((i=0; i<${#args[@]}; i++)); do
+            if [[ "${args[i]}" == "--session" ]] && [[ $((i+1)) -lt ${#args[@]} ]]; then
+                new_args+=("--session" "$existing_deriv")
+                ((i++))
+            else
+                new_args+=("${args[i]}")
+            fi
+        done
+        exec "$REAL" "${new_args[@]}"
+    fi
+
+    # Check if the base session daemon is already alive (another terminal or user owns it)
+    if is_session_alive "$session"; then
+        # Session exists; create a derivative so we don't touch the existing tab
+        derivative="${session}--${TERMINAL_ID}"
+        deriv_profile="$PROFILES/$derivative"
+        echo "$TAG session '$session' is in use; creating derivative '$derivative'" >&2
+
+        mkdir -p "$deriv_profile"
+
+        # Copy session state from the original so auth is shared
+        # Check for both .json and .json.enc (encryption appends .enc)
+        orig_state="$HOME/.agent-browser/sessions/${session}-${session}.json"
+        orig_state_enc="${orig_state}.enc"
+        deriv_state="$HOME/.agent-browser/sessions/${derivative}-${session}.json"
+        deriv_state_enc="${deriv_state}.enc"
+        if [[ -f "$orig_state_enc" ]]; then
+            cp "$orig_state_enc" "$deriv_state_enc" 2>/dev/null
+            echo "$TAG copied auth state from '$session' (.enc)" >&2
+        elif [[ -f "$orig_state" ]]; then
+            cp "$orig_state" "$deriv_state" 2>/dev/null
+            echo "$TAG copied auth state from '$session'" >&2
+        fi
+
+        # Record the mapping
+        set_derivative "$session" "$derivative"
+        track_ownership "$derivative"
+
+        # Build the derivative command
+        exec "$REAL" --session "$derivative" \
+            --profile "$deriv_profile" \
+            --session-name "$session" \
+            open ${url_arg:+"$url_arg"}
+    fi
+
+    # Session is NOT running; this terminal gets to be the primary owner
+    target_profile="${profile:-$PROFILES/$session}"
+
+    # Auto-create profile directory if needed
+    [[ -d "$target_profile" ]] || mkdir -p "$target_profile"
+
+    # Clean stale SingletonLock (Chrome crashed, lock left behind)
+    if [[ -L "$target_profile/SingletonLock" ]]; then
+        lock_target=$(readlink "$target_profile/SingletonLock" 2>/dev/null || true)
+        lock_pid="${lock_target##*-}"
+        if [[ -n "$lock_pid" ]]; then
+            if ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -f "$target_profile/SingletonLock" \
+                      "$target_profile/SingletonSocket" \
+                      "$target_profile/SingletonCookie"
+                echo "$TAG cleaned stale Chrome lock (dead PID $lock_pid)" >&2
+            fi
+        fi
+    fi
+
+    # Build extra flags to inject
+    extras=()
+    [[ -z "$profile" ]] && extras+=(--profile "$PROFILES/$session")
+    [[ -z "$sname" ]]   && extras+=(--session-name "$session")
+
+    # Warn on profile/session name mismatch
+    if [[ -n "$profile" ]]; then
+        pbase=$(basename "$profile")
+        if [[ "$pbase" != "$session" ]]; then
+            echo "$TAG WARNING: --profile '$pbase' != --session '$session'" >&2
+        fi
+    fi
+
+    track_ownership "$session"
+
+    # Inject extras before the subcommand and exec
+    if [[ ${#extras[@]} -gt 0 ]]; then
+        echo "$TAG injected: ${extras[*]}" >&2
+        final=()
+        for arg in "$@"; do
+            if [[ "$arg" == "open" || "$arg" == "connect" ]]; then
+                final+=("${extras[@]}")
+            fi
+            final+=("$arg")
+        done
+        exec "$REAL" "${final[@]}"
+    fi
+
+    exec "$REAL" "$@"
+fi
+
+# Handle explicit close: clean up derivative mapping + untrack ownership
+if $is_close && [[ -n "$session" ]]; then
+    # Check if this is a close on the original name but we have a derivative
+    derivative=$(get_derivative "$session")
+    if [[ -n "$derivative" ]]; then
+        # Close the derivative instead
+        echo "$TAG closing derivative '$derivative' for '$session'" >&2
+        remove_derivative "$session"
+        untrack_ownership "$derivative"
+        exec "$REAL" --session "$derivative" close
+    fi
+    untrack_ownership "$session"
+fi
+
+# Pass through unchanged
+exec "$REAL" "$@"

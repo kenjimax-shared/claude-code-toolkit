@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# lucy-gate: Run deterministic quality gates (lint, typecheck, test) on a task's worktree
+# Returns exit code 0 if all gates pass, 1 if any fail
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-gate <task-id> [--fix]"
+  echo ""
+  echo "Runs lint, typecheck, and tests on the task's worktree."
+  echo "If --fix is passed and gates fail, spawns an agent to fix the issues."
+  echo ""
+  echo "Tasks:"
+  read_tasks | jq -r '.[] | "  \(.id) (\(.status))"'
+  exit 1
+fi
+
+TASK_ID="$1"
+FIX=false
+if [ "${2:-}" = "--fix" ]; then
+  FIX=true
+fi
+
+TASK=$(get_task "$TASK_ID")
+if [ -z "$TASK" ]; then
+  echo "Error: Task '$TASK_ID' not found"
+  exit 1
+fi
+
+WORKTREE=$(echo "$TASK" | jq -r '.worktree')
+REPO=$(echo "$TASK" | jq -r '.repo')
+
+if [ ! -d "$WORKTREE" ]; then
+  echo "Error: Worktree '$WORKTREE' does not exist"
+  exit 1
+fi
+
+echo "Running quality gates on $TASK_ID"
+echo "  Worktree: $WORKTREE"
+echo ""
+
+FAILURES=""
+GATE_LOG=""
+
+# Detect project type and available tools
+HAS_PACKAGE_JSON=false
+HAS_TSCONFIG=false
+HAS_PYPROJECT=false
+HAS_CARGO=false
+HAS_GO_MOD=false
+
+[ -f "$WORKTREE/package.json" ] && HAS_PACKAGE_JSON=true
+[ -f "$WORKTREE/tsconfig.json" ] && HAS_TSCONFIG=true
+[ -f "$WORKTREE/pyproject.toml" ] && HAS_PYPROJECT=true
+[ -f "$WORKTREE/Cargo.toml" ] && HAS_CARGO=true
+[ -f "$WORKTREE/go.mod" ] && HAS_GO_MOD=true
+
+run_gate() {
+  local name="$1"
+  local cmd="$2"
+  echo -n "  $name... "
+  local output
+  if output=$(cd "$WORKTREE" && eval "$cmd" 2>&1); then
+    echo "PASS"
+    return 0
+  else
+    echo "FAIL"
+    FAILURES="$FAILURES\n### $name\n\`\`\`\n$(echo "$output" | tail -30)\n\`\`\`\n"
+    GATE_LOG="$GATE_LOG\n[$name FAILED]\n$output"
+    return 1
+  fi
+}
+
+PASSED=true
+
+# === JavaScript/TypeScript projects ===
+if $HAS_PACKAGE_JSON; then
+  PKG=$(cat "$WORKTREE/package.json")
+
+  # Detect package manager
+  PM="npm"
+  [ -f "$WORKTREE/pnpm-lock.yaml" ] && PM="pnpm"
+  [ -f "$WORKTREE/yarn.lock" ] && PM="yarn"
+  [ -f "$WORKTREE/bun.lockb" ] && PM="bun"
+
+  # Lint
+  if echo "$PKG" | jq -e '.scripts.lint' >/dev/null 2>&1; then
+    run_gate "Lint" "$PM run lint" || PASSED=false
+  elif echo "$PKG" | jq -e '.scripts["lint:check"]' >/dev/null 2>&1; then
+    run_gate "Lint" "$PM run lint:check" || PASSED=false
+  fi
+
+  # Typecheck
+  if $HAS_TSCONFIG; then
+    if echo "$PKG" | jq -e '.scripts.typecheck' >/dev/null 2>&1; then
+      run_gate "Typecheck" "$PM run typecheck" || PASSED=false
+    elif echo "$PKG" | jq -e '.scripts["type-check"]' >/dev/null 2>&1; then
+      run_gate "Type-check" "$PM run type-check" || PASSED=false
+    elif command -v npx >/dev/null 2>&1; then
+      run_gate "Typecheck" "npx tsc --noEmit" || PASSED=false
+    fi
+  fi
+
+  # Test
+  if echo "$PKG" | jq -e '.scripts.test' >/dev/null 2>&1; then
+    # Skip if test script is just "echo" or "exit 0" placeholder
+    TEST_SCRIPT=$(echo "$PKG" | jq -r '.scripts.test')
+    if [[ "$TEST_SCRIPT" != *"no test"* ]] && [[ "$TEST_SCRIPT" != *"exit 0"* ]]; then
+      run_gate "Test" "$PM test -- --passWithNoTests 2>/dev/null || $PM test" || PASSED=false
+    else
+      echo "  Test... SKIP (placeholder script)"
+    fi
+  fi
+
+  # Build check (catches import errors, missing modules)
+  if echo "$PKG" | jq -e '.scripts.build' >/dev/null 2>&1; then
+    run_gate "Build" "$PM run build" || PASSED=false
+  fi
+fi
+
+# === Python projects ===
+if $HAS_PYPROJECT; then
+  # Lint with ruff if available
+  if command -v ruff >/dev/null 2>&1; then
+    run_gate "Lint (ruff)" "ruff check ." || PASSED=false
+  fi
+
+  # Type check with mypy if configured
+  if grep -q "mypy" "$WORKTREE/pyproject.toml" 2>/dev/null; then
+    if command -v mypy >/dev/null 2>&1; then
+      run_gate "Typecheck (mypy)" "mypy ." || PASSED=false
+    fi
+  fi
+
+  # Test with pytest
+  if command -v pytest >/dev/null 2>&1; then
+    run_gate "Test (pytest)" "pytest -x -q" || PASSED=false
+  fi
+fi
+
+# === Rust projects ===
+if $HAS_CARGO; then
+  run_gate "Check (cargo)" "cargo check" || PASSED=false
+  run_gate "Clippy" "cargo clippy -- -D warnings 2>/dev/null || true" || PASSED=false
+  run_gate "Test (cargo)" "cargo test" || PASSED=false
+fi
+
+# === Go projects ===
+if $HAS_GO_MOD; then
+  run_gate "Vet" "go vet ./..." || PASSED=false
+  run_gate "Build" "go build ./..." || PASSED=false
+  run_gate "Test" "go test ./..." || PASSED=false
+fi
+
+echo ""
+
+if $PASSED; then
+  echo "All gates passed."
+  log "GATE $TASK_ID: all gates passed"
+  exit 0
+else
+  echo "Some gates failed."
+  log "GATE $TASK_ID: gates failed"
+
+  # Write failures to a file in the worktree for the agent
+  FAILURE_FILE="$WORKTREE/.lucy-gate-failures.md"
+  echo -e "# Gate Failures\n\nThe following quality gates failed. Fix these issues before the PR can proceed.\n$FAILURES" > "$FAILURE_FILE"
+
+  if $FIX; then
+    echo "Spawning fix agent..."
+
+    # Build a focused prompt for fixing gate failures
+    FIX_PROMPT="Quality gates failed on this branch. Read .lucy-gate-failures.md for the specific errors. Fix all issues, then commit and push."
+
+    model_name=$(echo "$TASK" | jq -r '.model')
+    agent_bin="${AGENT_BIN[$model_name]}"
+    model_id="${MODEL_MAP[$model_name]}"
+    tmux_name=$(echo "$TASK" | jq -r '.tmux')
+
+    # Write fix prompt
+    echo "$FIX_PROMPT" > "$WORKTREE/.lucy-prompt.md"
+
+    AGENT_LOG="$LUCY_DIR/logs/${TASK_ID}.log"
+    FIX_CMD=$(build_agent_cmd "$agent_bin" "$model_id" ".lucy-prompt.md" "$AGENT_LOG")
+
+    # Kill existing tmux if any
+    tmux kill-session -t "$tmux_name" 2>/dev/null || true
+
+    tmux new-session -d -s "$tmux_name" -c "$WORKTREE"
+    tmux send-keys -t "$tmux_name" "$FIX_CMD" Enter
+
+    update_task "$TASK_ID" "status" '"running"'
+    retries=$(echo "$TASK" | jq -r '.retries')
+    update_task "$TASK_ID" "retries" "$((retries + 1))"
+
+    log "GATE $TASK_ID: fix agent spawned"
+    # No push for automated gate fix
+  fi
+
+  exit 1
+fi

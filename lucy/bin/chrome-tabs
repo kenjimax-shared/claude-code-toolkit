@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# chrome-tabs: Tab lifecycle manager for shared Chrome debug instances.
+# Tracks tab ownership per terminal session, enables safe cleanup on exit.
+#
+# Usage:
+#   chrome-tabs init [session-id]           Snapshot current tabs, register session
+#   chrome-tabs track <tab-id> [session-id] Register a tab as owned by session
+#   chrome-tabs untrack <tab-id> [ses-id]   Remove tab from tracking (already closed)
+#   chrome-tabs cleanup [session-id]        Close tabs opened during this session
+#   chrome-tabs list                        Show all tabs and ownership
+#   chrome-tabs gc                          Garbage-collect dead sessions' tabs
+#   chrome-tabs cookie-snapshot [outfile]   Export cookies from shared Chrome
+#   chrome-tabs cookie-inject <port> [file] Import cookies into Chrome on port
+set -euo pipefail
+
+REGISTRY="$HOME/.claude/chrome-tabs"
+POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+LOG="$REGISTRY/chrome-tabs.log"
+
+mkdir -p "$REGISTRY"
+
+log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
+
+# ── Session ID detection ──────────────────────────────────────────
+get_session_id() {
+  local provided="${1:-}"
+  if [ -n "$provided" ]; then
+    echo "$provided"
+    return
+  fi
+  # Try tmux session name
+  if [ -n "${TMUX:-}" ]; then
+    tmux display-message -p '#S' 2>/dev/null && return
+  fi
+  # Fallback to PID
+  echo "pid-$$"
+}
+
+get_port() {
+  echo "${CHROME_DEBUG_PORT:-9222}"
+}
+
+# ── CDP HTTP helpers (run on Windows side via PowerShell) ─────────
+cdp_list_tabs() {
+  local port
+  port=$(get_port)
+  $POWERSHELL -NoProfile -Command '
+    try {
+      $r = Invoke-RestMethod -Uri "http://127.0.0.1:'"$port"'/json" -TimeoutSec 3
+      $pages = $r | Where-Object { $_.type -eq "page" }
+      $pages | ForEach-Object {
+        Write-Output "$($_.id)|$($_.url)|$($_.title)"
+      }
+    } catch {
+      exit 1
+    }
+  ' 2>/dev/null | tr -d '\r'
+}
+
+cdp_close_tab() {
+  local tab_id="$1"
+  local port
+  port=$(get_port)
+  $POWERSHELL -NoProfile -Command '
+    try {
+      Invoke-RestMethod -Uri "http://127.0.0.1:'"$port"'/json/close/'"$tab_id"'" -TimeoutSec 3 | Out-Null
+      Write-Output "closed"
+    } catch {
+      Write-Output "failed"
+    }
+  ' 2>/dev/null | tr -d '\r'
+}
+
+# ── Commands ──────────────────────────────────────────────────────
+
+cmd_init() {
+  local sid
+  sid=$(get_session_id "${1:-}")
+  local meta="$REGISTRY/${sid}.json"
+  local port
+  port=$(get_port)
+
+  # Get current tabs as baseline
+  local baseline_ids=()
+  while IFS='|' read -r tid url title; do
+    [ -n "$tid" ] && baseline_ids+=("\"$tid\"")
+  done < <(cdp_list_tabs)
+
+  local baseline_json
+  baseline_json=$(printf '%s,' "${baseline_ids[@]}" | sed 's/,$//')
+
+  # Detect tmux pane PID for liveness checks
+  local pane_pid=""
+  if [ -n "${TMUX:-}" ]; then
+    pane_pid=$(tmux display-message -p '#{pane_pid}' 2>/dev/null || echo "")
+  fi
+
+  cat > "$meta" <<EOF
+{
+  "session_id": "$sid",
+  "port": $port,
+  "pane_pid": "${pane_pid:-$$}",
+  "started_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "baseline_tabs": [${baseline_json}],
+  "owned_tabs": []
+}
+EOF
+
+  log "INIT $sid: port=$port baseline=${#baseline_ids[@]} tabs"
+  echo "Session '$sid' initialized, tracking ${#baseline_ids[@]} baseline tabs."
+}
+
+cmd_track() {
+  local tab_id="$1"
+  local sid
+  sid=$(get_session_id "${2:-}")
+  local meta="$REGISTRY/${sid}.json"
+
+  if [ ! -f "$meta" ]; then
+    # Auto-init if no session exists
+    cmd_init "$sid" > /dev/null
+  fi
+
+  # Add tab_id to owned_tabs if not already there
+  python3 -c "
+import json, sys
+meta_path = '$meta'
+tab_id = '$tab_id'
+with open(meta_path) as f:
+    data = json.load(f)
+if tab_id not in data.get('owned_tabs', []):
+    data.setdefault('owned_tabs', []).append(tab_id)
+    with open(meta_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f'Tracked tab {tab_id} for session {data[\"session_id\"]}')
+else:
+    print(f'Tab {tab_id} already tracked')
+"
+  log "TRACK $tab_id -> $sid"
+}
+
+cmd_untrack() {
+  local tab_id="$1"
+  local sid
+  sid=$(get_session_id "${2:-}")
+  local meta="$REGISTRY/${sid}.json"
+  [ -f "$meta" ] || return 0
+
+  python3 -c "
+import json
+meta_path = '$meta'
+tab_id = '$tab_id'
+with open(meta_path) as f:
+    data = json.load(f)
+owned = data.get('owned_tabs', [])
+if tab_id in owned:
+    owned.remove(tab_id)
+    data['owned_tabs'] = owned
+    with open(meta_path, 'w') as f:
+        json.dump(data, f, indent=2)
+"
+  log "UNTRACK $tab_id from $sid"
+}
+
+cmd_cleanup() {
+  local sid
+  sid=$(get_session_id "${1:-}")
+  local meta="$REGISTRY/${sid}.json"
+
+  if [ ! -f "$meta" ]; then
+    log "CLEANUP $sid: no session file, nothing to do"
+    return 0
+  fi
+
+  # Read owned tabs
+  local owned_tabs
+  owned_tabs=$(python3 -c "
+import json
+with open('$meta') as f:
+    data = json.load(f)
+for t in data.get('owned_tabs', []):
+    print(t)
+")
+
+  local count=0
+  if [ -n "$owned_tabs" ]; then
+    while read -r tab_id; do
+      [ -z "$tab_id" ] && continue
+      local result
+      result=$(cdp_close_tab "$tab_id")
+      if [ "$result" = "closed" ]; then
+        count=$((count + 1))
+        log "CLOSED $tab_id (session $sid)"
+      fi
+    done <<< "$owned_tabs"
+  fi
+
+  # Remove session file
+  rm -f "$meta"
+  log "CLEANUP $sid: closed $count tabs"
+  echo "Session '$sid' cleaned up: closed $count tab(s)."
+}
+
+cmd_list() {
+  local port
+  port=$(get_port)
+  echo "Chrome tabs on port $port:"
+  echo ""
+
+  # Build ownership map from all session files
+  local ownership_map
+  ownership_map=$(python3 -c "
+import json, glob, os
+registry = '$REGISTRY'
+ownership = {}
+for f in glob.glob(os.path.join(registry, '*.json')):
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+        sid = data.get('session_id', os.path.basename(f))
+        for t in data.get('owned_tabs', []):
+            ownership[t] = sid
+        for t in data.get('baseline_tabs', []):
+            if t not in ownership:
+                ownership[t] = f'(baseline:{sid})'
+    except Exception:
+        pass
+for tid, owner in ownership.items():
+    print(f'{tid}\t{owner}')
+")
+
+  # List live tabs with ownership
+  printf "%-38s %-25s %s\n" "TAB ID" "OWNER" "URL"
+  printf "%-38s %-25s %s\n" "------" "-----" "---"
+  while IFS='|' read -r tid url title; do
+    [ -z "$tid" ] && continue
+    local owner="(untracked)"
+    if [ -n "$ownership_map" ]; then
+      local match
+      match=$(echo "$ownership_map" | grep "^${tid}" | cut -f2)
+      [ -n "$match" ] && owner="$match"
+    fi
+    # Truncate URL for display
+    local short_url="${url:0:60}"
+    printf "%-38s %-25s %s\n" "$tid" "$owner" "$short_url"
+  done < <(cdp_list_tabs)
+
+  echo ""
+  echo "Active sessions:"
+  for f in "$REGISTRY"/*.json; do
+    [ -f "$f" ] || { echo "  (none)"; break; }
+    python3 -c "
+import json, os
+with open('$f') as fh:
+    d = json.load(fh)
+owned = len(d.get('owned_tabs', []))
+base = len(d.get('baseline_tabs', []))
+print(f'  {d[\"session_id\"]}: {owned} owned, {base} baseline, started {d[\"started_at\"]}')
+"
+  done
+}
+
+cmd_gc() {
+  echo "Garbage-collecting dead sessions..."
+  local cleaned=0
+  for meta in "$REGISTRY"/*.json; do
+    [ -f "$meta" ] || continue
+
+    local sid pane_pid
+    sid=$(python3 -c "import json; print(json.load(open('$meta'))['session_id'])")
+    pane_pid=$(python3 -c "import json; print(json.load(open('$meta')).get('pane_pid',''))")
+
+    # Check if the process is still alive
+    if [ -n "$pane_pid" ] && ! kill -0 "$pane_pid" 2>/dev/null; then
+      echo "  Dead session: $sid (pid $pane_pid)"
+      cmd_cleanup "$sid"
+      cleaned=$((cleaned + 1))
+    fi
+  done
+  echo "Cleaned up $cleaned dead session(s)."
+}
+
+cmd_cookie_snapshot() {
+  local outfile="${1:-$REGISTRY/cookies-snapshot.json}"
+  local port
+  port=$(get_port)
+
+  # Snapshot to a temp file first, then validate before overwriting
+  local tmpfile="${outfile}.tmp"
+  local win_tmpfile
+  win_tmpfile=$(wslpath -w "$tmpfile" 2>/dev/null || echo "$tmpfile")
+
+  $POWERSHELL -NoProfile -Command "
+    \$port = $port
+    \$outFile = '$win_tmpfile'
+    \$script = @'
+const http = require('http');
+const WebSocket = require('ws');
+
+async function main() {
+  const res = await new Promise((resolve, reject) => {
+    http.get('http://127.0.0.1:' + $port + '/json/version', r => {
+      let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(JSON.parse(d)));
+    }).on('error', reject);
+  });
+  const ws = new WebSocket(res.webSocketDebuggerUrl);
+  await new Promise(r => ws.on('open', r));
+  ws.send(JSON.stringify({id: 1, method: 'Storage.getCookies'}));
+  const msg = await new Promise(r => ws.on('message', d => r(JSON.parse(d))));
+  ws.close();
+  require('fs').writeFileSync(process.argv[2], JSON.stringify(msg.result.cookies, null, 2));
+  console.log(msg.result.cookies.length);
+}
+main().catch(e => { console.error(e.message); process.exit(1); });
+'@
+    \$tmpScript = Join-Path \$env:TEMP 'cookie-snapshot.js'
+    Set-Content -Path \$tmpScript -Value \$script
+    node \$tmpScript \$outFile
+    Remove-Item \$tmpScript -ErrorAction SilentlyContinue
+  " 2>/dev/null | tr -d '\r'
+
+  # Validate: don't overwrite a good snapshot with empty/corrupted data
+  if [ ! -f "$tmpfile" ]; then
+    log "COOKIE-SNAPSHOT FAILED: no output file produced"
+    echo "Cookie snapshot failed: Chrome not reachable or CDP error." >&2
+    return 1
+  fi
+
+  local new_count
+  new_count=$(python3 -c "import json; print(len(json.load(open('$tmpfile'))))" 2>/dev/null || echo "0")
+
+  if [ "$new_count" -lt 10 ]; then
+    log "COOKIE-SNAPSHOT REJECTED: only $new_count cookies (likely corrupted/empty session)"
+    echo "Cookie snapshot rejected: only $new_count cookies found (minimum: 10)." >&2
+    echo "Chrome may have restarted or cookies were cleared. Existing snapshot preserved." >&2
+    rm -f "$tmpfile"
+    return 1
+  fi
+
+  # If existing snapshot exists, check for drastic drop (>50% loss = suspicious)
+  if [ -f "$outfile" ]; then
+    local old_count
+    old_count=$(python3 -c "import json; print(len(json.load(open('$outfile'))))" 2>/dev/null || echo "0")
+
+    if [ "$old_count" -gt 50 ] && [ "$new_count" -lt $((old_count / 2)) ] && [ "${COOKIE_SNAPSHOT_FORCE:-false}" != "true" ]; then
+      log "COOKIE-SNAPSHOT REJECTED: $new_count cookies vs $old_count in existing (>50% drop)"
+      echo "Cookie snapshot rejected: $new_count cookies vs $old_count existing (>50% drop)." >&2
+      echo "This looks like a corrupted session. Existing snapshot preserved." >&2
+      echo "Use 'chrome-tabs cookie-snapshot --force' to override." >&2
+      rm -f "$tmpfile"
+      return 1
+    fi
+
+    # Rotate: keep previous snapshot as backup
+    cp "$outfile" "${outfile%.json}.backup.json"
+  fi
+
+  mv "$tmpfile" "$outfile"
+  log "COOKIE-SNAPSHOT OK: $new_count cookies -> $outfile"
+  echo "Cookie snapshot saved: $new_count cookies to $outfile"
+}
+
+cmd_cookie_inject() {
+  local target_port="$1"
+  local cookie_file="${2:-$REGISTRY/cookies-snapshot.json}"
+
+  if [ ! -f "$cookie_file" ]; then
+    echo "No cookie snapshot found at $cookie_file" >&2
+    echo "Run 'chrome-tabs cookie-snapshot' first." >&2
+    return 1
+  fi
+
+  local win_cookie_file
+  win_cookie_file=$(wslpath -w "$cookie_file" 2>/dev/null || echo "$cookie_file")
+
+  $POWERSHELL -NoProfile -Command "
+    \$port = $target_port
+    \$cookieFile = '$win_cookie_file'
+    \$script = @'
+const http = require('http');
+const WebSocket = require('ws');
+const fs = require('fs');
+
+async function main() {
+  const cookies = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const res = await new Promise((resolve, reject) => {
+    http.get('http://127.0.0.1:' + $target_port + '/json/version', r => {
+      let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(JSON.parse(d)));
+    }).on('error', reject);
+  });
+  const ws = new WebSocket(res.webSocketDebuggerUrl);
+  await new Promise(r => ws.on('open', r));
+  ws.send(JSON.stringify({id: 1, method: 'Storage.setCookies', params: {cookies}}));
+  const msg = await new Promise(r => ws.on('message', d => r(JSON.parse(d))));
+  ws.close();
+  console.log('Injected ' + cookies.length + ' cookies');
+}
+main().catch(e => { console.error(e.message); process.exit(1); });
+'@
+    \$tmpScript = Join-Path \$env:TEMP 'cookie-inject.js'
+    Set-Content -Path \$tmpScript -Value \$script
+    node \$tmpScript \$cookieFile
+    Remove-Item \$tmpScript -ErrorAction SilentlyContinue
+  " 2>/dev/null | tr -d '\r'
+
+  log "COOKIE-INJECT $cookie_file -> port $target_port"
+  echo "Cookies injected into Chrome on port $target_port."
+}
+
+# ── Main ──────────────────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  init)     cmd_init "${1:-}" ;;
+  track)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-tabs track <tab-id> [session-id]" >&2; exit 1; }
+    cmd_track "$@" ;;
+  untrack)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-tabs untrack <tab-id> [session-id]" >&2; exit 1; }
+    cmd_untrack "$@" ;;
+  cleanup)  cmd_cleanup "${1:-}" ;;
+  list)     cmd_list ;;
+  gc)       cmd_gc ;;
+  cookie-snapshot)
+    force=false
+    snap_args=()
+    for arg in "$@"; do
+      if [ "$arg" = "--force" ]; then force=true
+      else snap_args+=("$arg"); fi
+    done
+    COOKIE_SNAPSHOT_FORCE=$force cmd_cookie_snapshot "${snap_args[0]:-}" ;;
+  cookie-inject)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-tabs cookie-inject <port> [cookie-file]" >&2; exit 1; }
+    cmd_cookie_inject "$@" ;;
+  help|*)
+    cat <<'HELP'
+chrome-tabs: Tab lifecycle manager for shared Chrome debug instances
+
+Commands:
+  init [session-id]             Snapshot current tabs, register session
+  track <tab-id> [session-id]   Register a tab as owned by this session
+  untrack <tab-id> [session-id] Remove a tab from tracking
+  cleanup [session-id]          Close all owned tabs, remove session
+  list                          Show all tabs with ownership info
+  gc                            Close tabs from dead sessions
+  cookie-snapshot [outfile]     Export cookies from shared Chrome
+  cookie-inject <port> [file]   Import cookies into Chrome on <port>
+
+Session ID defaults to the tmux session name or PID.
+Port defaults to $CHROME_DEBUG_PORT (or 9222).
+HELP
+    ;;
+esac

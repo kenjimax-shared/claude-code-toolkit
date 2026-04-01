@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# chrome-session: Manage isolated Chrome debug sessions per terminal
+# Each session gets its own profile (targeted copy from base) and debug port.
+#
+# Usage:
+#   chrome-session start <session-id> [--visible]   Start a Chrome session
+#   chrome-session stop <session-id> [--merge]       Stop and clean up
+#   chrome-session list                              Show active sessions
+#   chrome-session port <session-id>                 Print port for a session
+#   chrome-session merge <session-id>                Merge session data back to base
+#
+# After 'start', sets CHROME_DEBUG_PORT in the caller's env (use eval):
+#   eval "$(chrome-session start my-session)"
+set -euo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────
+SESSIONS_DIR="$HOME/.claude/chrome-sessions"
+WIN_BASE_PROFILE='C:\Users\YOUR_USER\.claude\chrome-debug-profile'
+WIN_PROFILES_DIR='C:\Users\YOUR_USER\.claude\chrome-profiles'
+CHROME_EXE='C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
+POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+PORT_MIN=9223
+PORT_MAX=9399
+
+mkdir -p "$SESSIONS_DIR"
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+find_free_port() {
+  for port in $(seq $PORT_MIN $PORT_MAX); do
+    if ! grep -rql "\"port\": $port" "$SESSIONS_DIR/" 2>/dev/null; then
+      if ! $POWERSHELL -NoProfile -Command "
+        try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $port); \$c.Close(); Write-Output 'in-use' } catch { Write-Output 'free' }
+      " 2>/dev/null | tr -d '\r' | grep -q 'in-use'; then
+        echo "$port"
+        return 0
+      fi
+    fi
+  done
+  echo "ERROR: No free ports in range $PORT_MIN-$PORT_MAX" >&2
+  return 1
+}
+
+wait_for_chrome() {
+  local port="$1"
+  local max_wait=15
+  local waited=0
+  while [ $waited -lt $max_wait ]; do
+    if $POWERSHELL -NoProfile -Command "
+      try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $port); \$c.Close(); Write-Output 'ready' } catch { Write-Output 'waiting' }
+    " 2>/dev/null | tr -d '\r' | grep -q 'ready'; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# ── Commands ────────────────────────────────────────────────────────
+
+cmd_start() {
+  local session_id="$1"
+  local visible=false
+  if [ "${2:-}" = "--visible" ]; then
+    visible=true
+  fi
+
+  local meta_file="$SESSIONS_DIR/${session_id}.json"
+  local port=""
+  local win_profile="${WIN_PROFILES_DIR}\\${session_id}"
+  local needs_copy=true
+
+  # Case 1: Session exists and Chrome is alive → reuse
+  if [ -f "$meta_file" ]; then
+    local existing_port
+    existing_port=$(jq -r '.port' "$meta_file")
+    if $POWERSHELL -NoProfile -Command "
+      try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $existing_port); \$c.Close(); Write-Output 'alive' } catch { Write-Output 'dead' }
+    " 2>/dev/null | tr -d '\r' | grep -q 'alive'; then
+      echo "export CHROME_DEBUG_PORT=$existing_port"
+      echo "# Session '$session_id' already running on port $existing_port" >&2
+      return 0
+    fi
+
+    # Case 2: Session exists but Chrome died → relaunch with existing profile
+    # Keep the accumulated session data (cookies, logins made during this session)
+    local profile_exists
+    profile_exists=$($POWERSHELL -NoProfile -Command "
+      if (Test-Path '$win_profile\Default') { Write-Output 'yes' } else { Write-Output 'no' }
+    " 2>/dev/null | tr -d '\r')
+
+    if [ "$profile_exists" = "yes" ]; then
+      echo "# Chrome died, relaunching with existing session profile..." >&2
+      port="$existing_port"
+      needs_copy=false
+    fi
+    rm -f "$meta_file"
+  fi
+
+  # Allocate port if we don't have one from recovery
+  if [ -z "$port" ]; then
+    port=$(find_free_port) || exit 1
+  fi
+
+  # Case 3: Fresh session → copy essential data from base profile
+  if [ "$needs_copy" = true ]; then
+    echo "# Copying essential profile data..." >&2
+    $POWERSHELL -NoProfile -Command "
+      \$base = '$WIN_BASE_PROFILE\Default'
+      \$dest = '$win_profile\Default'
+      New-Item -Path \$dest -ItemType Directory -Force | Out-Null
+
+      # Extensions (the actual extension code, ~73 MB)
+      if (Test-Path \"\$base\Extensions\") { Copy-Item \"\$base\Extensions\" \"\$dest\Extensions\" -Recurse -Force }
+
+      # Extension data/settings
+      if (Test-Path \"\$base\Local Extension Settings\") { Copy-Item \"\$base\Local Extension Settings\" \"\$dest\Local Extension Settings\" -Recurse -Force }
+      if (Test-Path \"\$base\Extension State\") { Copy-Item \"\$base\Extension State\" \"\$dest\Extension State\" -Recurse -Force }
+
+      # IndexedDB (extension storage, e.g. Proton Pass vault data)
+      if (Test-Path \"\$base\IndexedDB\") { Copy-Item \"\$base\IndexedDB\" \"\$dest\IndexedDB\" -Recurse -Force -ErrorAction SilentlyContinue }
+
+      # Preferences (extension configs, settings, Chrome prefs)
+      if (Test-Path \"\$base\Preferences\") { Copy-Item \"\$base\Preferences\" \"\$dest\Preferences\" -Force -ErrorAction SilentlyContinue }
+      if (Test-Path \"\$base\Secure Preferences\") { Copy-Item \"\$base\Secure Preferences\" \"\$dest\Secure Preferences\" -Force -ErrorAction SilentlyContinue }
+
+      # Local State (top-level, needed for Chrome profile detection)
+      \$baseParent = '$WIN_BASE_PROFILE'
+      if (Test-Path \"\$baseParent\Local State\") { Copy-Item \"\$baseParent\Local State\" '$win_profile\Local State' -Force -ErrorAction SilentlyContinue }
+
+      # Web Data (autofill, saved passwords)
+      if (Test-Path \"\$base\Web Data\") { Copy-Item \"\$base\Web Data\" \"\$dest\Web Data\" -Force -ErrorAction SilentlyContinue }
+
+      # Login Data (saved passwords)
+      if (Test-Path \"\$base\Login Data\") { Copy-Item \"\$base\Login Data\" \"\$dest\Login Data\" -Force -ErrorAction SilentlyContinue }
+
+      Write-Output 'copy-ok'
+    " 2>/dev/null | tr -d '\r' | grep -q 'copy-ok' || {
+      echo "# ERROR: Failed to copy profile data" >&2
+      return 1
+    }
+  fi
+
+  # Build Chrome arguments
+  # Anti-invalidation flags prevent Chrome from managing/revoking Google sessions
+  local chrome_args="'--remote-debugging-port=$port','--user-data-dir=$win_profile','--no-first-run','--disable-sync','--disable-background-networking','--disable-features=IdentityConsistency,SigninInterceptBubble,DiceWebSigninInterceptionFeature,DiceResponseHeader','--disable-client-side-phishing-detection'"
+  if [ "$visible" = false ]; then
+    chrome_args="'--headless=new','--disable-gpu',$chrome_args"
+  fi
+
+  # Launch Chrome and capture PID
+  echo "# Launching Chrome on port $port..." >&2
+  local chrome_pid
+  chrome_pid=$($POWERSHELL -NoProfile -Command "
+    \$p = Start-Process '$CHROME_EXE' -ArgumentList $chrome_args -PassThru
+    Write-Output \$p.Id
+  " 2>/dev/null | tr -d '\r')
+
+  if [ -z "$chrome_pid" ]; then
+    echo "# ERROR: Failed to launch Chrome" >&2
+    return 1
+  fi
+
+  # Wait for Chrome to be ready
+  echo "# Waiting for Chrome to be ready..." >&2
+  if ! wait_for_chrome "$port"; then
+    echo "# WARNING: Chrome may not be fully ready on port $port" >&2
+  fi
+
+  # Save session metadata (escape backslashes for valid JSON)
+  local win_profile_escaped="${win_profile//\\/\\\\}"
+  cat > "$meta_file" <<EOF
+{
+  "session_id": "$session_id",
+  "port": $port,
+  "chrome_pid": $chrome_pid,
+  "profile_dir": "$win_profile_escaped",
+  "visible": $visible,
+  "created_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+
+  # Inject cookies from shared Chrome snapshot (if available)
+  local cookie_snapshot="$HOME/.claude/chrome-tabs/cookies-snapshot.json"
+  if [ -f "$cookie_snapshot" ]; then
+    echo "# Injecting cookies from shared Chrome snapshot..." >&2
+    CHROME_DEBUG_PORT=$port "$HOME/.claude/lucy/bin/chrome-tabs" cookie-inject "$port" "$cookie_snapshot" 2>/dev/null || true
+  fi
+
+  echo "# Chrome session '$session_id' started: port=$port pid=$chrome_pid" >&2
+  echo "export CHROME_DEBUG_PORT=$port"
+}
+
+cmd_stop() {
+  local session_id="$1"
+  local do_merge=false
+  if [ "${2:-}" = "--merge" ]; then
+    do_merge=true
+  fi
+
+  local meta_file="$SESSIONS_DIR/${session_id}.json"
+  if [ ! -f "$meta_file" ]; then
+    echo "No session found: $session_id" >&2
+    return 0
+  fi
+
+  local port chrome_pid profile_dir
+  port=$(jq -r '.port' "$meta_file")
+  chrome_pid=$(jq -r '.chrome_pid' "$meta_file")
+  profile_dir=$(jq -r '.profile_dir' "$meta_file")
+
+  # Optional merge before cleanup
+  if [ "$do_merge" = true ]; then
+    cmd_merge "$session_id"
+  fi
+
+  # Merge cookies back to shared Chrome before killing this instance
+  # This ensures logins made in the isolated instance persist
+  echo "Merging cookies back to shared Chrome..." >&2
+  CHROME_DEBUG_PORT=$port "$HOME/.claude/lucy/bin/chrome-tabs" cookie-snapshot "$HOME/.claude/chrome-tabs/cookies-isolated-${session_id}.json" 2>/dev/null || true
+  if [ -f "$HOME/.claude/chrome-tabs/cookies-isolated-${session_id}.json" ]; then
+    CHROME_DEBUG_PORT=9222 "$HOME/.claude/lucy/bin/chrome-tabs" cookie-inject 9222 "$HOME/.claude/chrome-tabs/cookies-isolated-${session_id}.json" 2>/dev/null || true
+    rm -f "$HOME/.claude/chrome-tabs/cookies-isolated-${session_id}.json"
+    echo "Cookies merged back to shared Chrome." >&2
+  fi
+
+  # Kill Chrome process tree using taskkill (/T = tree, /F = force)
+  echo "Killing Chrome (pid=$chrome_pid, port=$port)..." >&2
+  $POWERSHELL -NoProfile -Command "
+    # Kill by PID tree first
+    cmd /c \"taskkill /PID $chrome_pid /T /F\" 2>&1 | Out-Null
+    # Also kill any chrome.exe referencing this session's profile
+    Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" -ErrorAction SilentlyContinue |
+      Where-Object { \$_.CommandLine -match [regex]::Escape('$session_id') } |
+      ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }
+  " 2>/dev/null || true
+
+  # Remove profile directory
+  echo "Removing profile: $profile_dir" >&2
+  $POWERSHELL -NoProfile -Command "
+    Start-Sleep -Milliseconds 500
+    Remove-Item -Path '$profile_dir' -Recurse -Force -ErrorAction SilentlyContinue
+  " 2>/dev/null || true
+
+  # Remove session metadata
+  rm -f "$meta_file"
+  echo "Session '$session_id' stopped and cleaned up." >&2
+}
+
+cmd_list() {
+  if [ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]; then
+    echo "No active Chrome sessions."
+    return
+  fi
+
+  printf "%-30s %-6s %-8s %-8s %s\n" "SESSION" "PORT" "PID" "STATUS" "CREATED"
+  printf "%-30s %-6s %-8s %-8s %s\n" "-------" "----" "---" "------" "-------"
+
+  for meta_file in "$SESSIONS_DIR"/*.json; do
+    [ -f "$meta_file" ] || continue
+    local sid port pid created status
+    sid=$(jq -r '.session_id' "$meta_file")
+    port=$(jq -r '.port' "$meta_file")
+    pid=$(jq -r '.chrome_pid' "$meta_file")
+    created=$(jq -r '.created_at' "$meta_file")
+
+    if $POWERSHELL -NoProfile -Command "
+      try { \$c = [System.Net.Sockets.TcpClient]::new(); \$c.Connect('127.0.0.1', $port); \$c.Close(); Write-Output 'alive' } catch { Write-Output 'dead' }
+    " 2>/dev/null | tr -d '\r' | grep -q 'alive'; then
+      status="alive"
+    else
+      status="dead"
+    fi
+
+    printf "%-30s %-6s %-8s %-8s %s\n" "$sid" "$port" "$pid" "$status" "$created"
+  done
+}
+
+cmd_port() {
+  local session_id="$1"
+  local meta_file="$SESSIONS_DIR/${session_id}.json"
+  if [ ! -f "$meta_file" ]; then
+    echo "9222"  # Fallback to shared instance
+    return
+  fi
+  jq -r '.port' "$meta_file"
+}
+
+cmd_merge() {
+  local session_id="$1"
+  local meta_file="$SESSIONS_DIR/${session_id}.json"
+  if [ ! -f "$meta_file" ]; then
+    echo "No session found: $session_id" >&2
+    return 1
+  fi
+
+  local profile_dir
+  profile_dir=$(jq -r '.profile_dir' "$meta_file")
+
+  echo "Merging session profile back to base template..." >&2
+  echo "  Source: $profile_dir" >&2
+  echo "  Target: $WIN_BASE_PROFILE" >&2
+
+  $POWERSHELL -NoProfile -Command "
+    \$src = '$profile_dir\Default'
+    \$dst = '$WIN_BASE_PROFILE\Default'
+
+    # Merge extensions (new installs or updates; /XO = skip older files)
+    Write-Output '  Extensions...'
+    robocopy \"\$src\Extensions\" \"\$dst\Extensions\" /E /XO /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1 | Out-Null
+
+    # Merge extension data
+    Write-Output '  Local Extension Settings...'
+    robocopy \"\$src\Local Extension Settings\" \"\$dst\Local Extension Settings\" /E /XO /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1 | Out-Null
+
+    Write-Output '  Extension State...'
+    robocopy \"\$src\Extension State\" \"\$dst\Extension State\" /E /XO /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1 | Out-Null
+
+    # Merge IndexedDB (extension storage)
+    Write-Output '  IndexedDB...'
+    robocopy \"\$src\IndexedDB\" \"\$dst\IndexedDB\" /E /XO /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1 | Out-Null
+
+    # Merge Preferences
+    Write-Output '  Preferences...'
+    Copy-Item \"\$src\Preferences\" \"\$dst\Preferences\" -Force -ErrorAction SilentlyContinue
+    Copy-Item \"\$src\Secure Preferences\" \"\$dst\Secure Preferences\" -Force -ErrorAction SilentlyContinue
+
+    Write-Output 'Merge complete.'
+  " 2>/dev/null || true
+
+  echo "Merge complete." >&2
+}
+
+# ── Main ────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  start)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-session start <session-id> [--visible]" >&2; exit 1; }
+    cmd_start "$@"
+    ;;
+  stop)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-session stop <session-id> [--merge]" >&2; exit 1; }
+    cmd_stop "$@"
+    ;;
+  list)
+    cmd_list
+    ;;
+  port)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-session port <session-id>" >&2; exit 1; }
+    cmd_port "$@"
+    ;;
+  merge)
+    [ -z "${1:-}" ] && { echo "Usage: chrome-session merge <session-id>" >&2; exit 1; }
+    cmd_merge "$@"
+    ;;
+  help|*)
+    cat <<'HELP'
+chrome-session: Manage isolated Chrome debug sessions
+
+Commands:
+  start <id> [--visible]   Copy base profile, launch Chrome on a free port
+  stop <id> [--merge]      Kill Chrome, remove session profile
+  list                     Show all active sessions
+  port <id>                Print the debug port for a session
+  merge <id>               Merge session extensions/data back to base template
+
+After 'start', eval the output to set CHROME_DEBUG_PORT:
+  eval "$(chrome-session start my-session)"
+HELP
+    ;;
+esac

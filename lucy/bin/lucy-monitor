@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# lucy-monitor: Cron script that checks agent sessions, detects PRs, triggers reviews
+# Run via cron every 5 minutes: */5 * * * * ~/.claude/lucy/bin/lucy-monitor
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+TASKS=$(read_tasks)
+COUNT=$(echo "$TASKS" | jq 'length')
+
+if [ "$COUNT" -eq 0 ]; then
+  exit 0
+fi
+
+CHANGED=false
+
+# Dynamic prompt refinement: analyze failure and write improved prompt
+refine_prompt() {
+  local task_id="$1"
+  local worktree="$2"
+  local log_file="$3"
+  local original_prompt="$worktree/.lucy-prompt.md"
+
+  # Skip if no log or log is too small
+  if [ ! -f "$log_file" ] || [ "$(wc -c < "$log_file")" -lt 500 ]; then
+    return
+  fi
+
+  # Extract last errors and agent activity from the log
+  local failure_context
+  failure_context=$(tail -n 200 "$log_file" | jq -r '
+    select(.type == "assistant") |
+    .message.content[]? |
+    if .type == "text" then .text
+    elif .type == "tool_use" then "[TOOL] " + .name + ": " + (.input | to_entries | map(.key + "=" + (.value | tostring | .[0:100])) | join(", "))
+    else empty end
+  ' 2>/dev/null | tail -40)
+
+  # Read previous plan (living document with progress, decisions, discoveries)
+  local previous_plan=""
+  local plan_file="$worktree/.lucy-plan.md"
+  if [ ! -f "$plan_file" ]; then
+    plan_file="$LUCY_DIR/tasks/$(basename "$worktree")/.lucy-plan.md"
+  fi
+  if [ -f "$plan_file" ]; then
+    previous_plan=$(cat "$plan_file" 2>/dev/null || echo "")
+  fi
+
+  # If we got useful context, call Claude to refine the prompt
+  if [ -n "$failure_context" ] && [ ${#failure_context} -gt 100 ]; then
+    log "REFINE $task_id: analyzing failure to improve prompt (plan: ${#previous_plan} bytes)"
+    local original
+    original=$(cat "$original_prompt" 2>/dev/null || echo "(original prompt not found)")
+
+    local plan_section=""
+    if [ -n "$previous_plan" ]; then
+      plan_section="
+PREVIOUS ATTEMPT'S PLAN (living document with progress, decisions, and discoveries):
+$previous_plan
+
+The plan above shows what the previous agent accomplished, what decisions it made, and what surprises it found. Use this to avoid repeating failed approaches and to build on any progress made."
+    fi
+
+    local refined
+    refined=$(claude --model claude-haiku-4-5 --dangerously-skip-permissions -p "You are a prompt engineer. An AI coding agent was given the task below but failed to complete it. Analyze what went wrong and rewrite the prompt to help the next attempt succeed.
+
+ORIGINAL PROMPT:
+$original
+${plan_section}
+
+AGENT'S LAST ACTIVITY (what it was doing before failing):
+$failure_context
+
+Rewrite the original prompt with:
+1. The same core task
+2. Specific guidance to avoid the failure that occurred
+3. If the agent got stuck on a specific error, include the fix or workaround
+4. If the agent went in circles, tell it exactly which approach to take
+5. If the previous plan made progress, tell the new agent what was already completed so it can skip those steps
+6. If the previous plan logged decisions or discoveries, include the relevant ones so the new agent benefits from them
+
+Output ONLY the improved prompt text, nothing else." 2>/dev/null || echo "")
+
+    if [ -n "$refined" ] && [ ${#refined} -gt 50 ]; then
+      echo "$refined" > "$original_prompt"
+      log "REFINE $task_id: prompt refined ($(wc -c < "$original_prompt") bytes)"
+    else
+      log "REFINE $task_id: refinement failed, keeping original prompt"
+    fi
+  fi
+}
+
+# Kill a tmux session if it exists (cleanup after task transitions)
+kill_tmux_if_alive() {
+  local session="$1"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux kill-session -t "$session" 2>/dev/null || true
+    log "CLEANUP killed tmux session: $session"
+  fi
+}
+
+# Helper: get GitHub remote for a repo (checks if fork, returns parent if so)
+gh_remote() {
+  local repo_dir="$WORKTREE_ROOT/$1"
+  local origin
+  origin=$(git -C "$repo_dir" remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | sed 's/.*github.com[:/]\(.*\)/\1/')
+  # Check if this is a fork; if so, PRs go to the parent repo
+  local parent
+  parent=$(gh api "repos/$origin" --jq '.parent.full_name // empty' 2>/dev/null || echo "")
+  if [ -n "$parent" ]; then
+    echo "$parent"
+  else
+    echo "$origin"
+  fi
+}
+
+# Process each task based on its status
+echo "$TASKS" | jq -c '.[]' | while IFS= read -r task; do
+  id=$(echo "$task" | jq -r '.id')
+  status=$(echo "$task" | jq -r '.status')
+  tmux_name=$(echo "$task" | jq -r '.tmux')
+  branch=$(echo "$task" | jq -r '.branch // empty')
+  repo=$(echo "$task" | jq -r '.repo')
+  task_type=$(echo "$task" | jq -r '.type // "feature"')
+  retries=$(echo "$task" | jq -r '.retries')
+  max_retries=$(echo "$task" | jq -r '.max_retries')
+  pr=$(echo "$task" | jq -r '.pr // empty')
+  notified=$(echo "$task" | jq -r '.notified')
+  worktree=$(echo "$task" | jq -r '.worktree')
+
+  # Only resolve GitHub remote for code tasks with a repo
+  REMOTE=""
+  if [ -n "$repo" ] && [ "$task_type" != "ops" ]; then
+    REMOTE=$(gh_remote "$repo")
+  fi
+
+  case "$status" in
+
+    running)
+      # Check if tmux session is still alive
+      if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+
+        # Ops tasks: check for .lucy-done.md in the task dir
+        if [ "$task_type" = "ops" ]; then
+          OPS_META="$LUCY_DIR/tasks/${id}"
+          # Compute effective max retries (rate-limit deaths are transient, get bonus)
+          AGENT_LOG="$LUCY_DIR/logs/${id}.log"
+          effective_max="$max_retries"
+          if is_rate_limit_death "$AGENT_LOG"; then
+            effective_max=$((max_retries + RATE_LIMIT_BONUS_RETRIES))
+            log "MONITOR $id: rate-limit death detected (effective max retries: $effective_max)"
+          fi
+          if [ -f "$OPS_META/.lucy-done.md" ]; then
+            log "MONITOR $id: ops agent done, triggering verification"
+            update_task "$id" "status" '"verifying"'
+            kill_tmux_if_alive "$tmux_name"
+            "$SCRIPT_DIR/lucy-verify" "$id" &
+            CHANGED=true
+          elif [ -f "$OPS_META/.lucy-stuck.md" ]; then
+            log "MONITOR $id: ops agent stuck"
+            update_task "$id" "status" '"stuck"'
+            notify "Lucy" "Ops agent stuck: $id"
+            CHANGED=true
+          elif [ "$retries" -lt "$effective_max" ]; then
+            log "MONITOR $id: ops session dead, retrying ($((retries + 1))/$effective_max)"
+            update_task "$id" "retries" "$((retries + 1))"
+            refine_prompt "$id" "$worktree" "$AGENT_LOG"
+            model_name=$(echo "$task" | jq -r '.model')
+            agent_bin="${AGENT_BIN[$model_name]}"
+            model_id="${MODEL_MAP[$model_name]}"
+            RESPAWN_CMD=$(build_agent_cmd "$agent_bin" "$model_id" ".lucy-prompt.md" "$AGENT_LOG")
+            tmux new-session -d -s "$tmux_name" -c "$worktree"
+            tmux send-keys -t "$tmux_name" "$RESPAWN_CMD" Enter
+            # No push for automated retry
+            CHANGED=true
+          else
+            update_task "$id" "status" '"failed"'
+            update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            notify "Lucy" "Ops agent failed: $id (max retries)"
+            CHANGED=true
+          fi
+          continue
+        fi
+
+        # Code tasks: check if a PR was created before it died.
+        PR_NUM=$(gh pr list --repo "$REMOTE" --head "$branch" --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+        if [ -n "$PR_NUM" ]; then
+          log "MONITOR $id: session dead but PR #$PR_NUM found"
+          update_task "$id" "status" '"pr_open"'
+          update_task "$id" "pr" "$PR_NUM"
+          kill_tmux_if_alive "$tmux_name"
+          CHANGED=true
+        else
+          # Compute effective max retries (rate-limit deaths are transient, get bonus)
+          AGENT_LOG="$LUCY_DIR/logs/${id}.log"
+          effective_max="$max_retries"
+          if is_rate_limit_death "$AGENT_LOG"; then
+            effective_max=$((max_retries + RATE_LIMIT_BONUS_RETRIES))
+            log "MONITOR $id: rate-limit death detected (effective max retries: $effective_max)"
+          fi
+          # Check if agent wrote a stuck file
+          if [ -f "$worktree/.lucy-stuck.md" ]; then
+            log "MONITOR $id: agent stuck"
+            update_task "$id" "status" '"stuck"'
+            notify "Lucy" "Agent stuck: $id. Check .lucy-stuck.md"
+            CHANGED=true
+          elif [ "$retries" -lt "$effective_max" ]; then
+            log "MONITOR $id: session dead, no PR, retrying ($((retries + 1))/$effective_max)"
+            update_task "$id" "retries" "$((retries + 1))"
+
+            # Dynamic prompt refinement: analyze failure before retrying
+            refine_prompt "$id" "$worktree" "$AGENT_LOG"
+
+            # Respawn: create new tmux session in existing worktree
+            model_name=$(echo "$task" | jq -r '.model')
+            agent_bin="${AGENT_BIN[$model_name]}"
+            model_id="${MODEL_MAP[$model_name]}"
+            RESPAWN_CMD=$(build_agent_cmd "$agent_bin" "$model_id" ".lucy-prompt.md" "$AGENT_LOG")
+            tmux new-session -d -s "$tmux_name" -c "$worktree"
+            tmux send-keys -t "$tmux_name" "$RESPAWN_CMD" Enter
+
+            # No push for automated retry
+            CHANGED=true
+          else
+            log "MONITOR $id: session dead, max retries reached, marking failed"
+            update_task "$id" "status" '"failed"'
+            update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            notify "Lucy" "Agent failed: $id (max retries reached)"
+            CHANGED=true
+          fi
+        fi
+      else
+        # Session alive.
+        if [ "$task_type" = "ops" ]; then
+          # Check if ops agent marked done while still running
+          OPS_META="$LUCY_DIR/tasks/${id}"
+          if [ -f "$OPS_META/.lucy-done.md" ]; then
+            log "MONITOR $id: ops agent marked done, triggering verification"
+            update_task "$id" "status" '"verifying"'
+            kill_tmux_if_alive "$tmux_name"
+            "$SCRIPT_DIR/lucy-verify" "$id" &
+            CHANGED=true
+          fi
+        else
+          # Check if PR was created while session still running.
+          PR_NUM=$(gh pr list --repo "$REMOTE" --head "$branch" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PR_NUM" ]; then
+            log "MONITOR $id: PR #$PR_NUM detected while agent still running"
+            update_task "$id" "status" '"pr_open"'
+            update_task "$id" "pr" "$PR_NUM"
+            kill_tmux_if_alive "$tmux_name"
+            CHANGED=true
+          fi
+        fi
+      fi
+      ;;
+
+    pr_open)
+      # Check CI status on the PR
+      if [ -z "$pr" ]; then
+        continue
+      fi
+
+      # Get check suite status
+      CI_STATUS=$(gh pr checks "$pr" --repo "$REMOTE" --json name,state --jq '[.[].state] | if length == 0 then "none" elif all(. == "SUCCESS") then "pass" elif any(. == "FAILURE") then "fail" else "pending" end' 2>/dev/null || echo "none")
+
+      case "$CI_STATUS" in
+        pass|none)
+          if [ "$CI_STATUS" = "pass" ]; then
+            log "MONITOR $id: CI passed on PR #$pr, running quality gates"
+          else
+            log "MONITOR $id: No CI on PR #$pr, running quality gates"
+          fi
+
+          # Run deterministic gates (lint, typecheck, test) before review
+          if "$SCRIPT_DIR/lucy-gate" "$id" 2>/dev/null; then
+            log "MONITOR $id: Gates passed, triggering review"
+            update_task "$id" "status" '"reviewing"'
+            "$SCRIPT_DIR/lucy-review" "$id" &
+          else
+            log "MONITOR $id: Gates failed on PR #$pr"
+            if [ "$retries" -lt "$max_retries" ]; then
+              update_task "$id" "retries" "$((retries + 1))"
+              update_task "$id" "status" '"running"'
+
+              # Respawn agent to fix gate failures (failures written to .lucy-gate-failures.md by lucy-gate)
+              AGENT_LOG="$LUCY_DIR/logs/${id}.log"
+              model_name=$(echo "$task" | jq -r '.model')
+              agent_bin="${AGENT_BIN[$model_name]}"
+              model_id="${MODEL_MAP[$model_name]}"
+
+              echo "Quality gates failed. Read .lucy-gate-failures.md for the errors. Fix all lint, typecheck, and test failures. Then commit and push." > "$worktree/.lucy-prompt.md"
+              GATE_FIX_CMD=$(build_agent_cmd "$agent_bin" "$model_id" ".lucy-prompt.md" "$AGENT_LOG")
+
+              tmux kill-session -t "$tmux_name" 2>/dev/null || true
+              tmux new-session -d -s "$tmux_name" -c "$worktree"
+              tmux send-keys -t "$tmux_name" "$GATE_FIX_CMD" Enter
+
+              # No push for automated gate fix retry
+            else
+              update_task "$id" "status" '"failed"'
+              update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+              notify "Lucy" "Gates failed on $id PR #$pr, max retries reached"
+            fi
+          fi
+          CHANGED=true
+          ;;
+        fail)
+          log "MONITOR $id: CI failed on PR #$pr"
+          if [ "$retries" -lt "$max_retries" ]; then
+            update_task "$id" "retries" "$((retries + 1))"
+            update_task "$id" "status" '"running"'
+
+            # Dynamic prompt refinement for CI failures
+            AGENT_LOG="$LUCY_DIR/logs/${id}.log"
+            refine_prompt "$id" "$worktree" "$AGENT_LOG"
+
+            model_name=$(echo "$task" | jq -r '.model')
+            agent_bin="${AGENT_BIN[$model_name]}"
+            model_id="${MODEL_MAP[$model_name]}"
+
+            echo "CI failed on PR #$pr in repo $REMOTE. Check the failures with 'gh pr checks $pr --repo $REMOTE' and fix them. Then commit and push the fix." > "$worktree/.lucy-prompt.md"
+            CI_FIX_CMD=$(build_agent_cmd "$agent_bin" "$model_id" ".lucy-prompt.md" "$AGENT_LOG")
+
+            tmux kill-session -t "$tmux_name" 2>/dev/null || true
+            tmux new-session -d -s "$tmux_name" -c "$worktree"
+            tmux send-keys -t "$tmux_name" "$CI_FIX_CMD" Enter
+
+            # No push for automated CI fix retry
+            CHANGED=true
+          else
+            update_task "$id" "status" '"failed"'
+            update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            notify "Lucy" "CI failed on $id PR #$pr, max retries reached"
+            CHANGED=true
+          fi
+          ;;
+        pending)
+          # Still running, do nothing
+          ;;
+      esac
+      ;;
+
+    reviewing)
+      # Check if all reviews have been posted
+      if [ -z "$pr" ]; then
+        continue
+      fi
+
+      # Count review comments from Lucy bots
+      REVIEW_COUNT=$(gh api "repos/$REMOTE/issues/$pr/comments" --jq '[.[] | select(.body | startswith("## Lucy Review"))] | length' 2>/dev/null || echo "0")
+
+      # We expect at least 1 review (Claude). Codex and Gemini are bonus.
+      if [ "$REVIEW_COUNT" -ge 1 ]; then
+        # Check if reviews flagged critical issues
+        HAS_CRITICAL=$(gh api "repos/$REMOTE/issues/$pr/comments" --jq '[.[] | select(.body | test("CRITICAL|BLOCK|DO NOT MERGE"; "i"))] | length' 2>/dev/null || echo "0")
+
+        if [ "$HAS_CRITICAL" -gt 0 ]; then
+          log "MONITOR $id: Reviews posted but critical issues found"
+          notify "Lucy" "PR #$pr has critical review findings: $id"
+        else
+          log "MONITOR $id: Reviews passed ($REVIEW_COUNT reviews), marking ready"
+          update_task "$id" "status" '"ready"'
+          kill_tmux_if_alive "${TMUX_PREFIX}-r-${id}"
+          if [ "$notified" = "false" ]; then
+            notify "Lucy" "PR #$pr ready to merge: $id ($REVIEW_COUNT reviews passed)"
+            update_task "$id" "notified" 'true'
+          fi
+        fi
+        CHANGED=true
+      fi
+      ;;
+
+    verifying)
+      # Check if verification agent finished
+      VERIFY_TMUX="${TMUX_PREFIX}-v-${id}"
+      if ! tmux has-session -t "$VERIFY_TMUX" 2>/dev/null; then
+        # Verification agent finished, check results
+        if [ "$task_type" = "ops" ]; then
+          VERIFY_FILE="$LUCY_DIR/tasks/${id}/.lucy-verification.md"
+        else
+          VERIFY_FILE="$worktree/.lucy-verification.md"
+        fi
+        if [ -f "$VERIFY_FILE" ]; then
+          # Check for PASS/FAIL verdict
+          if grep -qi "^## Verdict" "$VERIFY_FILE" && grep -qi "PASS" "$VERIFY_FILE"; then
+            log "MONITOR $id: Verification PASSED"
+            update_task "$id" "status" '"ready"'
+            if [ "$notified" = "false" ]; then
+              notify "Lucy" "Task verified and ready: $id"
+              update_task "$id" "notified" 'true'
+            fi
+          else
+            log "MONITOR $id: Verification FAILED"
+            notify "Lucy" "Verification failed: $id. Check .lucy-verification.md"
+            # Don't auto-retry verification failures; needs human review
+            update_task "$id" "status" '"failed"'
+            update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+          fi
+        else
+          log "MONITOR $id: Verification agent finished but no report found"
+          update_task "$id" "status" '"failed"'
+          update_task "$id" "failed_at" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+          notify "Lucy" "Verification agent finished without report: $id"
+        fi
+        CHANGED=true
+      fi
+      ;;
+
+    ready|merged|failed|killed|stuck)
+      # Terminal states, nothing to do
+      ;;
+  esac
+done
+
+if $CHANGED; then
+  log "MONITOR cycle complete (changes made)"
+else
+  log "MONITOR cycle complete (no changes)"
+fi
+
+# ── Orchestrator: now handled by lucy-assess (cron) ──
+# The old approach of spawning a persistent Claude session per group
+# is replaced by periodic one-shot assessments via lucy-assess.
+# lucy-assess runs on its own cron schedule (*/5) and writes to assessments-*.json.
+# No orchestrator tmux sessions to manage.

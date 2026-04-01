@@ -1,0 +1,17 @@
+# Claude Code Toolkit - Example Crontab Entries
+# Add these with: crontab -e
+
+# Save agent-browser session state every 2 minutes (crash safety net)
+*/2 * * * * $HOME/.claude/lucy/bin/agent-browser-state-save >> $HOME/.agent-browser/state-save.log 2>&1
+
+# Auto-update agent-browser weekly
+0 4 * * 0 /usr/bin/npm install -g agent-browser@latest >> $HOME/.agent-browser/auto-update.log 2>&1
+
+# Lucy monitor: check agent status every 5 minutes (optional, for multi-agent use)
+# */5 * * * * $HOME/.claude/lucy/bin/lucy-monitor >> $HOME/.claude/lucy/monitor.log 2>&1
+
+# Lucy assess: periodic orchestrator assessment (optional, for multi-agent use)
+# */5 * * * * $HOME/.claude/lucy/bin/lucy-assess >> $HOME/.claude/lucy/assess.log 2>&1
+
+# Workspace token health check (optional, for Google Workspace MCP)
+# 0 * * * * bash $HOME/.claude/hooks/workspace-token-check.sh >> $HOME/.claude/hooks/workspace-token-check.log 2>&1
