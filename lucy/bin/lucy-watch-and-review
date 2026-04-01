@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# lucy-watch-and-review: Watch fix agents, auto-trigger reviews, notify when done
+# Usage: lucy-watch-and-review <task-id> [<task-id>...]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-watch-and-review <task-id> [<task-id>...]"
+  exit 1
+fi
+
+TASK_IDS=("$@")
+PENDING_REVIEW=()
+PENDING_NOTIFY=()
+COMPLETED=()
+
+notify() {
+  local title="$1"
+  local msg="$2"
+  echo "[$(date '+%H:%M:%S')] NOTIFY: $title - $msg"
+}
+
+echo "[$(date '+%H:%M:%S')] Watching ${#TASK_IDS[@]} tasks for completion..."
+
+while true; do
+  for task_id in "${TASK_IDS[@]}"; do
+    # Skip already completed tasks
+    if printf '%s\n' "${COMPLETED[@]}" | grep -qx "$task_id" 2>/dev/null; then
+      continue
+    fi
+
+    # Check if task is already queued for review
+    if printf '%s\n' "${PENDING_REVIEW[@]}" | grep -qx "$task_id" 2>/dev/null; then
+      continue
+    fi
+
+    # Check if review is in progress (waiting for notify)
+    if printf '%s\n' "${PENDING_NOTIFY[@]}" | grep -qx "$task_id" 2>/dev/null; then
+      # Check if review tmux session is still alive
+      review_tmux="${TMUX_PREFIX}-r-${task_id}"
+      if [ ${#review_tmux} -gt 80 ]; then
+        review_tmux="${review_tmux:0:80}"
+      fi
+      if ! tmux has-session -t "$review_tmux" 2>/dev/null; then
+        # Review session is gone; check if it posted to GitHub
+        TASK=$(get_task "$task_id")
+        pr=$(echo "$TASK" | jq -r '.pr // empty')
+        if [ -n "$pr" ]; then
+          echo "[$(date '+%H:%M:%S')] Review completed for $task_id (PR #$pr)"
+          COMPLETED+=("$task_id")
+          # Remove from PENDING_NOTIFY
+          PENDING_NOTIFY=("${PENDING_NOTIFY[@]/$task_id/}")
+        fi
+      fi
+      continue
+    fi
+
+    # Check task status
+    TASK=$(get_task "$task_id")
+    status=$(echo "$TASK" | jq -r '.status // "unknown"')
+    pr=$(echo "$TASK" | jq -r '.pr // empty')
+
+    case "$status" in
+      ready|reviewing|pr_open|pr_merged)
+        if [ -n "$pr" ]; then
+          echo "[$(date '+%H:%M:%S')] $task_id has PR #$pr (status: $status), launching review..."
+          lucy-review "$task_id" 2>&1
+          PENDING_NOTIFY+=("$task_id")
+        fi
+        ;;
+      running|planning)
+        # Still working, keep polling
+        echo "[$(date '+%H:%M:%S')] $task_id still $status..."
+        ;;
+      failed)
+        echo "[$(date '+%H:%M:%S')] $task_id FAILED"
+        COMPLETED+=("$task_id")
+        notify "Lucy Agent Failed" "$task_id failed. Check logs."
+        ;;
+      done)
+        COMPLETED+=("$task_id")
+        ;;
+      *)
+        echo "[$(date '+%H:%M:%S')] $task_id has unknown status: $status (pr: ${pr:-none})"
+        ;;
+    esac
+  done
+
+  # Check if all tasks are completed
+  real_completed=0
+  for task_id in "${TASK_IDS[@]}"; do
+    if printf '%s\n' "${COMPLETED[@]}" | grep -qx "$task_id" 2>/dev/null; then
+      real_completed=$((real_completed + 1))
+    fi
+  done
+
+  if [ "$real_completed" -eq "${#TASK_IDS[@]}" ]; then
+    echo "[$(date '+%H:%M:%S')] All tasks reviewed!"
+    notify "Lucy Reviews Done" "All ${#TASK_IDS[@]} fix PRs have been reviewed. Ready for merge."
+    break
+  fi
+
+  sleep 30
+done

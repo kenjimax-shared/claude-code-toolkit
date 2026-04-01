@@ -23,7 +23,7 @@ Options:
   --max-retries <n>   Max retries on failure (default: 3)
 
 Example:
-  lucy-spawn --repo Cabana --type bugfix --model sonnet \
+  lucy-spawn --repo MyProject --type bugfix --model sonnet \
     --desc "Fix typo in README" --issue 123
 USAGE
   exit 1

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# claude-isolated: Launch Claude Code with an isolated Chrome session.
+# Usage: claude-isolated [--visible] [claude args...]
+#
+# This wrapper:
+#   1. Creates an isolated Chrome session (copied profile, unique port)
+#   2. Exports CHROME_DEBUG_PORT so the MCP connects to the right instance
+#   3. Runs Claude Code
+#   4. On exit, kills Chrome and cleans up the profile
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Parse our flags vs Claude flags
+VISIBLE=""
+CLAUDE_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --visible) VISIBLE="--visible"; shift ;;
+    *) CLAUDE_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Generate session ID from tmux session name or PID
+if [ -n "${TMUX:-}" ]; then
+  SESSION_ID=$(tmux display-message -p '#S' 2>/dev/null || echo "manual-$$")
+else
+  SESSION_ID="manual-$$"
+fi
+
+# Sanitize session ID (remove characters that are bad for filenames)
+SESSION_ID=$(echo "$SESSION_ID" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+
+echo "Starting isolated Chrome session: $SESSION_ID"
+
+# Start Chrome session (eval sets CHROME_DEBUG_PORT)
+eval "$("$SCRIPT_DIR/chrome-session" start "$SESSION_ID" $VISIBLE)"
+
+echo "Chrome ready on port $CHROME_DEBUG_PORT"
+
+# Ensure WSLENV passes the port to Windows processes (for MCP)
+export WSLENV="${WSLENV:+$WSLENV:}CHROME_DEBUG_PORT"
+
+# Ensure cleanup on exit (kill Chrome, remove profile)
+cleanup() {
+  echo ""
+  echo "Cleaning up Chrome session: $SESSION_ID (merging data back to base)"
+  "$SCRIPT_DIR/chrome-session" stop "$SESSION_ID" --merge 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Launch Claude Code (use the real binary, not our wrapper)
+# Update the path below to point to your real Claude binary.
+export _CLAUDE_ISOLATED=1
+"$HOME/.local/bin/claude" "${CLAUDE_ARGS[@]}"

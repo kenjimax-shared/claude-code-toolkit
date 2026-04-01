@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Wrapper for `claude` command.
+# By default, uses the shared Chrome debug profile (port 9222).
+# For isolated Chrome sessions, use `claude-isolated` instead.
+#
+# Update the path below to point to your real Claude binary.
+exec "$HOME/.local/bin/claude" "$@"

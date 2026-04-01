@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# lucy-group-cleanup: Kill all agents belonging to a specific group
+# Called when an orchestrator session exits to clean up its agents.
+# Usage: lucy-group-cleanup <group>
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+GROUP="${1:-}"
+if [ -z "$GROUP" ]; then
+  echo "Usage: lucy-group-cleanup <group>"
+  exit 1
+fi
+
+log "GROUP-CLEANUP started for group=$GROUP"
+
+TASKS=$(read_tasks)
+KILLED=0
+
+echo "$TASKS" | jq -c --arg g "$GROUP" '.[] | select((.group // "default") == $g) | select(.status == "running" or .status == "reviewing" or .status == "verifying" or .status == "stuck" or .status == "pr_open")' | while IFS= read -r task; do
+  id=$(echo "$task" | jq -r '.id')
+  tmux_name=$(echo "$task" | jq -r '.tmux')
+
+  echo "Killing agent: $id (tmux: $tmux_name)"
+
+  # Kill worker tmux
+  tmux kill-session -t "$tmux_name" 2>/dev/null || true
+  # Kill review/verify tmux sessions too
+  tmux kill-session -t "${TMUX_PREFIX}-r-${id}" 2>/dev/null || true
+  tmux kill-session -t "${TMUX_PREFIX}-v-${id}" 2>/dev/null || true
+
+  # Stop isolated Chrome session if any
+  "$LUCY_BIN/chrome-session" stop "$id" --merge 2>/dev/null || true
+
+  # Mark as killed
+  update_task "$id" "status" '"killed"'
+
+  log "GROUP-CLEANUP killed $id"
+  KILLED=$((KILLED + 1))
+done
+
+# Kill the orchestrator session itself if still alive
+ORCH_SESSION="lucy-orch-${GROUP}"
+tmux kill-session -t "$ORCH_SESSION" 2>/dev/null || true
+
+log "GROUP-CLEANUP finished group=$GROUP"
+echo "Group cleanup complete for '$GROUP'."

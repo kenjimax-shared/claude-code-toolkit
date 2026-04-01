@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# lucy-log: Show real-time parsed activity from an agent's stream-json log
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: lucy-log <task-id> [--raw] [--review]"
+  echo ""
+  echo "Options:"
+  echo "  --raw       Show raw stream-json instead of parsed output"
+  echo "  --review    Show the review log instead of the agent log"
+  echo ""
+  echo "Tasks:"
+  read_tasks | jq -r '.[] | "  \(.id) (\(.status))"'
+  exit 1
+fi
+
+TASK_ID="$1"
+RAW=false
+REVIEW=false
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw) RAW=true; shift ;;
+    --review) REVIEW=true; shift ;;
+    *) shift ;;
+  esac
+done
+
+if $REVIEW; then
+  LOG_PATH="$LUCY_DIR/logs/${TASK_ID}-review.log"
+else
+  LOG_PATH="$LUCY_DIR/logs/${TASK_ID}.log"
+fi
+
+if [ ! -f "$LOG_PATH" ]; then
+  echo "No log file found at $LOG_PATH"
+  echo "Agent may not have started yet, or log was cleaned up."
+  exit 1
+fi
+
+TASK=$(get_task "$TASK_ID")
+STATUS=$(echo "$TASK" | jq -r '.status // "unknown"')
+
+if $RAW; then
+  echo "=== Raw log: $LOG_PATH ==="
+  if [ "$STATUS" = "running" ] || [ "$STATUS" = "reviewing" ]; then
+    tail -f "$LOG_PATH"
+  else
+    cat "$LOG_PATH"
+  fi
+  exit 0
+fi
+
+echo "=== Agent activity: $TASK_ID ($STATUS) ==="
+echo "  (Ctrl+C to stop)"
+echo ""
+
+if [ "$STATUS" = "running" ] || [ "$STATUS" = "reviewing" ]; then
+  # Live tail, parse each line as it arrives
+  tail -f "$LOG_PATH" | while IFS= read -r line; do
+    type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+    case "$type" in
+      assistant)
+        msg=$(echo "$line" | jq -r '
+          [.message.content[]? |
+            if .type == "text" then "  " + .text
+            elif .type == "tool_use" then "  [TOOL] " + .name + "(" + (.input | to_entries | map(.key + "=" + (.value | tostring | .[0:80])) | join(", ")) + ")"
+            else empty end
+          ] | join("\n")' 2>/dev/null)
+        [ -n "$msg" ] && echo "$msg"
+        ;;
+      result)
+        # Show tool results briefly
+        subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null)
+        if [ "$subtype" = "success" ]; then
+          preview=$(echo "$line" | jq -r '(.content // "") | .[0:150]' 2>/dev/null)
+          [ -n "$preview" ] && echo "  [OK] ${preview}..."
+        elif [ "$subtype" = "error" ]; then
+          preview=$(echo "$line" | jq -r '(.content // "") | .[0:150]' 2>/dev/null)
+          [ -n "$preview" ] && echo "  [ERR] ${preview}"
+        fi
+        ;;
+    esac
+  done
+else
+  # Finished, parse entire log
+  parse_agent_log "$LOG_PATH" 50
+fi

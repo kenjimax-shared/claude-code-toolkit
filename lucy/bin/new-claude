@@ -1,0 +1,12 @@
+#!/bin/bash
+# Atomic lock: only the first instance proceeds, duplicates exit
+LOCKDIR="/tmp/.new-claude-lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    exit 0
+fi
+# Clean up lock after 3s in background (survives exec)
+(sleep 3; rmdir "$LOCKDIR" 2>/dev/null) &
+
+# Update the path below to your project working directory
+cd ~/Claude
+exec tmux new-session 'claude --dangerously-skip-permissions'

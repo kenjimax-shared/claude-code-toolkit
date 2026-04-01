@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# ab-doctor: diagnose agent-browser session health
+# Reports profile mismatches, stale locks, missing profiles, /tmp fallbacks.
+
+set -euo pipefail
+
+REAL="$HOME/.npm-global/bin/agent-browser"
+PROFILES="$HOME/.agent-browser/profiles"
+AB_DIR="$HOME/.agent-browser"
+RED='\033[0;31m'
+YEL='\033[0;33m'
+GRN='\033[0;32m'
+RST='\033[0m'
+issues=0
+
+echo "=== agent-browser health check ==="
+echo ""
+
+# Get active sessions
+active=$("$REAL" session list 2>/dev/null \
+  | sed 's/\x1b\[[0-9;]*m//g' \
+  | grep -v "Active sessions:" \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+  | sed 's/^→[[:space:]]*//' \
+  | grep -E '^[a-zA-Z0-9_-]+$' \
+  | xargs 2>/dev/null || true)
+
+if [ -z "$active" ]; then
+    echo "No active sessions."
+    exit 0
+fi
+
+for session in $active; do
+    pid_file="$AB_DIR/${session}.pid"
+    daemon_pid=$(cat "$pid_file" 2>/dev/null || echo "")
+
+    printf "%-20s " "$session"
+
+    # Check daemon is alive
+    if [ -z "$daemon_pid" ] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+        printf "${RED}DEAD DAEMON${RST} (PID $daemon_pid)\n"
+        issues=$((issues + 1))
+        continue
+    fi
+
+    # Find Chrome child process
+    chrome_pid=""
+    for child in $(pgrep -P "$daemon_pid" 2>/dev/null); do
+        if grep -q 'chrome' /proc/$child/cmdline 2>/dev/null; then
+            chrome_pid="$child"
+            break
+        fi
+        for grandchild in $(pgrep -P "$child" 2>/dev/null); do
+            if grep -q 'chrome' /proc/$grandchild/cmdline 2>/dev/null; then
+                chrome_pid="$grandchild"
+                break 2
+            fi
+        done
+    done
+
+    if [ -z "$chrome_pid" ]; then
+        printf "${RED}NO CHROME${RST} (daemon alive but no browser)\n"
+        issues=$((issues + 1))
+        continue
+    fi
+
+    # Extract user-data-dir
+    data_dir=$(cat /proc/$chrome_pid/cmdline 2>/dev/null | tr '\0' '\n' | grep 'user-data-dir' | sed 's/--user-data-dir=//' | head -1)
+
+    if [ -z "$data_dir" ]; then
+        printf "${RED}NO PROFILE DIR${RST}\n"
+        issues=$((issues + 1))
+        continue
+    fi
+
+    expected="$PROFILES/$session"
+
+    if [[ "$data_dir" == /tmp/* ]]; then
+        printf "${RED}EPHEMERAL${RST} $data_dir\n"
+        printf "%-20s   expected: %s\n" "" "$expected"
+        issues=$((issues + 1))
+    elif [[ "$data_dir" != "$expected" ]]; then
+        actual_name=$(basename "$data_dir")
+        printf "${YEL}MISMATCH${RST} using profile '$actual_name' (expected '$session')\n"
+        issues=$((issues + 1))
+    else
+        printf "${GRN}OK${RST} profile=$session chrome=$chrome_pid\n"
+    fi
+done
+
+echo ""
+
+# Check for stale locks in profile dirs
+stale_locks=0
+for profile_dir in "$PROFILES"/*/; do
+    [ -d "$profile_dir" ] || continue
+    name=$(basename "$profile_dir")
+    if [ -L "$profile_dir/SingletonLock" ]; then
+        lock_target=$(readlink "$profile_dir/SingletonLock" 2>/dev/null || true)
+        lock_pid="${lock_target##*-}"
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            echo -e "${YEL}STALE LOCK${RST}: $name (PID $lock_pid is dead)"
+            stale_locks=$((stale_locks + 1))
+        fi
+    fi
+done
+
+if [ $stale_locks -gt 0 ]; then
+    echo "  Run: ab-doctor --fix to clean stale locks"
+    issues=$((issues + stale_locks))
+fi
+
+# Check for orphaned /tmp profile dirs
+tmp_count=$(ls -d /tmp/agent-browser-chrome-* 2>/dev/null | wc -l)
+if [ "$tmp_count" -gt 0 ]; then
+    echo ""
+    echo -e "${YEL}ORPHANED TEMP DIRS${RST}: $tmp_count dirs in /tmp/agent-browser-chrome-*"
+fi
+
+# Fix mode
+if [[ "${1:-}" == "--fix" ]]; then
+    echo ""
+    echo "=== Fixing stale locks ==="
+    for profile_dir in "$PROFILES"/*/; do
+        [ -d "$profile_dir" ] || continue
+        name=$(basename "$profile_dir")
+        if [ -L "$profile_dir/SingletonLock" ]; then
+            lock_target=$(readlink "$profile_dir/SingletonLock" 2>/dev/null || true)
+            lock_pid="${lock_target##*-}"
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -f "$profile_dir/SingletonLock" "$profile_dir/SingletonSocket" "$profile_dir/SingletonCookie"
+                echo "  Cleaned: $name (was PID $lock_pid)"
+            fi
+        fi
+    done
+    echo "Done."
+fi
+
+echo ""
+if [ $issues -eq 0 ]; then
+    echo -e "${GRN}All sessions healthy.${RST}"
+else
+    echo -e "${RED}$issues issue(s) found.${RST}"
+fi
+
+exit $issues

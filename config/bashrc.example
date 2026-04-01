@@ -1,0 +1,12 @@
+# Claude Code Toolkit - .bashrc additions
+# Add these lines to your ~/.bashrc
+
+# Lucy multi-agent orchestrator bin directory (takes priority for wrappers)
+export PATH="$HOME/.claude/lucy/bin:$PATH"
+
+# agent-browser configuration
+# Generate a key: openssl rand -hex 32 > ~/.agent-browser/.encryption-key
+export AGENT_BROWSER_ENCRYPTION_KEY="$(cat ~/.agent-browser/.encryption-key 2>/dev/null || true)"
+# Default headless; override with AGENT_BROWSER_HEADED=1 for auth flows
+export AGENT_BROWSER_HEADED=0
+export AGENT_BROWSER_ARGS="--start-minimized"

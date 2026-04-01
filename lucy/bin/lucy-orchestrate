@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# lucy-orchestrate: Persistent orchestrator with inbox-based IPC
+#
+# Runs lucy-assess in a polling loop. Checks an inbox file for user messages
+# and triggers immediate assessments when messages arrive.
+# Normal assessment interval is configurable (default 5 min).
+# Inbox poll interval is 15 seconds for responsive chat.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+# Parse args
+MODEL="opus"
+DETACH=false
+ASSESS_INTERVAL=300  # full assessment every 5 min
+POLL_INTERVAL=15     # check inbox every 15s
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)    MODEL="$2"; shift 2 ;;
+    --detach)   DETACH=true; shift ;;
+    --interval) ASSESS_INTERVAL="$2"; shift 2 ;;
+    --poll)     POLL_INTERVAL="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: lucy-orchestrate [--model haiku|sonnet] [--interval <secs>] [--poll <secs>] [--detach]"
+      echo ""
+      echo "Persistent orchestrator: runs lucy-assess on schedule, processes inbox messages."
+      echo ""
+      echo "Options:"
+      echo "  --model <m>       Model for assessment (default: haiku)"
+      echo "  --interval <s>    Seconds between full assessments (default: 300)"
+      echo "  --poll <s>        Seconds between inbox checks (default: 15)"
+      echo "  --detach          Launch in background tmux session"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+TMUX_SESSION="lucy-orch"
+INBOX_FILE="$LUCY_DIR/inbox.jsonl"
+
+# Validate numeric arguments
+if ! [[ "$ASSESS_INTERVAL" =~ ^[0-9]+$ ]] || [ "$ASSESS_INTERVAL" -lt 10 ]; then
+  echo "Error: --interval must be a positive integer >= 10"; exit 1
+fi
+if ! [[ "$POLL_INTERVAL" =~ ^[0-9]+$ ]] || [ "$POLL_INTERVAL" -lt 5 ]; then
+  echo "Error: --poll must be a positive integer >= 5"; exit 1
+fi
+
+# Check if already running (skip if we ARE the orchestrator session)
+if [ "${LUCY_ORCH_INNER:-}" != "1" ] && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "Orchestrator is already running in tmux session '$TMUX_SESSION'."
+  echo "  Attach: tmux attach -t $TMUX_SESSION"
+  echo "  Kill:   tmux kill-session -t $TMUX_SESSION"
+  if ! $DETACH; then
+    echo ""
+    echo "Attaching now..."
+    exec tmux attach -t "$TMUX_SESSION"
+  fi
+  exit 0
+fi
+
+# Cleanup on exit: kill all active agent groups
+cleanup_all_groups() {
+  echo ""
+  echo "[$(date '+%H:%M:%S')] Orchestrator shutting down, cleaning up agents..."
+  local groups
+  groups=$(read_tasks | jq -r '[.[] | select(.status == "running" or .status == "stuck" or .status == "pr_open" or .status == "reviewing" or .status == "verifying") | .group // "default"] | unique | .[]' 2>/dev/null || true)
+  for grp in $groups; do
+    "$SCRIPT_DIR/lucy-group-cleanup" "$grp" 2>/dev/null || true
+  done
+  log "ORCHESTRATE stopped"
+}
+
+# Clear stale data from previous orchestrator runs
+clear_stale_data() {
+  echo "[$(date '+%H:%M:%S')] Clearing stale data from previous runs..."
+  local cleared=0
+
+  # 1. Prune tasks.json: remove entries whose tmux sessions are dead
+  python3 -c "
+import json, subprocess, sys, os
+tf = '$TASKS_FILE'
+hf = '$HISTORY_FILE'
+try:
+    tasks = json.load(open(tf))
+except: sys.exit(0)
+if not tasks: sys.exit(0)
+try:
+    history = json.load(open(hf))
+except: history = []
+active, pruned = [], []
+for t in tasks:
+    tmux = t.get('tmux', '')
+    r = subprocess.run(['tmux', 'has-session', '-t', tmux], capture_output=True)
+    if r.returncode != 0:
+        # tmux dead: archive it
+        pruned.append(t)
+    else:
+        active.append(t)
+if pruned:
+    history.extend(pruned)
+    json.dump(active, open(tf, 'w'), indent=2)
+    json.dump(history, open(hf, 'w'), indent=2)
+    print(len(pruned))
+else:
+    print(0)
+" 2>/dev/null
+  local pruned
+  pruned=$(python3 -c "
+import json, subprocess
+tf = '$TASKS_FILE'
+try:
+    tasks = json.load(open(tf))
+except: tasks = []
+# Get active groups
+active_groups = set()
+for t in tasks:
+    active_groups.add(t.get('group', 'default'))
+print(' '.join(active_groups) if active_groups else '')
+" 2>/dev/null)
+
+  # 2. Remove assessment files for groups with no active tasks
+  for f in "$LUCY_DIR"/assessments-*.json; do
+    [ -f "$f" ] || continue
+    local grp
+    grp=$(basename "$f" | sed 's/^assessments-//;s/\.json$//')
+    if [ -z "$pruned" ] || ! echo "$pruned" | grep -qw "$grp"; then
+      rm -f "$f"
+      cleared=$((cleared + 1))
+    fi
+  done
+
+  # 3. Reset orchestrator feed (start fresh)
+  if [ -f "$LUCY_DIR/orchestrator-feed.jsonl" ] && [ -s "$LUCY_DIR/orchestrator-feed.jsonl" ]; then
+    : > "$LUCY_DIR/orchestrator-feed.jsonl"
+    cleared=$((cleared + 1))
+  fi
+
+  # 4. Clear the legacy assessments.json
+  rm -f "$LUCY_DIR/assessments.json"
+
+  [ "$cleared" -gt 0 ] && echo "[$(date '+%H:%M:%S')] Cleared $cleared stale data file(s)"
+  log "ORCHESTRATE cleared stale data ($cleared files)"
+}
+
+# Print a human-readable summary of the latest assessment
+print_assessment_summary() {
+  local assess_file="$LUCY_DIR/assessments.json"
+  [ -f "$assess_file" ] || return 0
+
+  python3 -c "
+import json, sys
+try:
+    data = json.load(open('$assess_file'))
+except: sys.exit(0)
+
+summary = data.get('summary', '')
+assessments = data.get('assessments', {})
+needs_input = data.get('needs_input', [])
+interventions = data.get('interventions', [])
+
+if not assessments and not needs_input:
+    sys.exit(0)
+
+print()
+print('  ┌─ Assessment Summary ──────────────────────')
+if summary:
+    print(f'  │ {summary}')
+    print('  │')
+
+for tid, a in assessments.items():
+    verdict = a.get('verdict', '?')
+    icons = {'on-track': '✓', 'drifting': '~', 'stuck': '!', 'blocked': '✗', 'done': '★', 'needs-input': '?'}
+    icon = icons.get(verdict, '·')
+    s = a.get('summary', '')
+    print(f'  │ [{icon}] {tid}: {verdict}')
+    if s:
+        print(f'  │     {s}')
+    for flag in a.get('assumptions_flagged', []):
+        print(f'  │     ⚠ {flag[:120]}')
+
+if needs_input:
+    print('  │')
+    print('  │ Needs input:')
+    for item in needs_input:
+        if isinstance(item, dict):
+            sev = item.get('severity', 'info')
+            text = item.get('item', '')
+        else:
+            sev, text = 'info', str(item)
+        print(f'  │   [{sev}] {text[:120]}')
+
+if interventions:
+    print('  │')
+    print('  │ Interventions:')
+    for iv in interventions:
+        tid = iv.get('task_id', '?')
+        action = iv.get('action', '?')
+        msg = iv.get('message', '')
+        print(f'  │   {action} {tid}: {msg[:100]}')
+
+print('  └──────────────────────────────────────────')
+print()
+" 2>/dev/null || true
+}
+
+# The main orchestrator loop
+orchestrate_loop() {
+  local last_assess=0
+
+  # Ensure inbox exists
+  touch "$INBOX_FILE"
+
+  # Clear stale state from any previous orchestrator run
+  clear_stale_data
+
+  log "ORCHESTRATE started model=$MODEL assess=${ASSESS_INTERVAL}s poll=${POLL_INTERVAL}s"
+  echo "Lucy orchestrator running (model=$MODEL)"
+  echo "  Assessment every: ${ASSESS_INTERVAL}s"
+  echo "  Inbox poll every: ${POLL_INTERVAL}s"
+  echo "  Inbox file: $INBOX_FILE"
+  echo "  Dashboard: http://$(hostname -I | awk '{print $1}'):3100"
+  echo ""
+
+  while true; do
+    local now
+    now=$(date +%s)
+    local run_assess=false
+
+    # Check inbox for pending messages
+    if [ -s "$INBOX_FILE" ]; then
+      local msg_count
+      msg_count=$(wc -l < "$INBOX_FILE")
+      echo "[$(date '+%H:%M:%S')] Inbox: $msg_count message(s) pending, triggering assessment"
+      run_assess=true
+    fi
+
+    # Check if assessment interval has elapsed
+    local elapsed=$((now - last_assess))
+    if [ "$elapsed" -ge "$ASSESS_INTERVAL" ]; then
+      run_assess=true
+    fi
+
+    if $run_assess; then
+      echo "[$(date '+%H:%M:%S')] Running assessment cycle..."
+
+      # Sync task state first
+      "$SCRIPT_DIR/lucy-monitor" >> "$LOG_FILE" 2>&1 || true
+
+      # Run assessment (reads inbox internally)
+      "$SCRIPT_DIR/lucy-assess" --model "$MODEL" --verbose 2>&1 || true
+
+      # Print human-readable summary of decisions
+      print_assessment_summary
+
+      # Auto-archive terminal tasks with dead tmux sessions
+      local archived=0
+      archived=$(python3 -c "
+import json, subprocess, sys
+tf = '$TASKS_FILE'
+hf = '$HISTORY_FILE'
+try:
+    tasks = json.load(open(tf))
+except: sys.exit(0)
+try:
+    history = json.load(open(hf))
+except: history = []
+active, archive = [], []
+for t in tasks:
+    if t.get('status') in ('ready','merged','failed','killed'):
+        r = subprocess.run(['tmux','has-session','-t',t.get('tmux','')], capture_output=True)
+        if r.returncode != 0:
+            archive.append(t)
+            continue
+    active.append(t)
+if archive:
+    history.extend(archive)
+    json.dump(active, open(tf,'w'), indent=2)
+    json.dump(history, open(hf,'w'), indent=2)
+print(len(archive))
+" 2>/dev/null || echo 0)
+      [ "$archived" -gt 0 ] && echo "[$(date '+%H:%M:%S')] Auto-archived $archived terminal task(s)"
+
+      # Clean up assessment files for groups with no remaining active tasks
+      python3 -c "
+import json, os, glob
+tf = '$TASKS_FILE'
+lucy = '$LUCY_DIR'
+try:
+    tasks = json.load(open(tf))
+except: tasks = []
+active_groups = {t.get('group', 'default') for t in tasks if t.get('status') not in ('ready','merged','failed','killed')}
+for f in glob.glob(os.path.join(lucy, 'assessments-*.json')):
+    grp = os.path.basename(f).replace('assessments-', '').replace('.json', '')
+    if grp not in active_groups:
+        os.remove(f)
+" 2>/dev/null || true
+
+      last_assess=$(date +%s)
+      echo "[$(date '+%H:%M:%S')] Cycle complete. Next check in ${POLL_INTERVAL}s."
+      echo ""
+    fi
+
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+if $DETACH; then
+  tmux new-session -d -s "$TMUX_SESSION"
+  # Re-invoke ourselves in the tmux session (without --detach to run in foreground)
+  tmux send-keys -t "$TMUX_SESSION" "LUCY_ORCH_INNER=1 $0 --model $MODEL --interval $ASSESS_INTERVAL --poll $POLL_INTERVAL" Enter
+
+  echo "Orchestrator launched in tmux session '$TMUX_SESSION'."
+  echo "  Attach:    tmux attach -t $TMUX_SESSION"
+  echo "  Kill:      tmux kill-session -t $TMUX_SESSION"
+  echo "  Dashboard: http://$(hostname -I | awk '{print $1}'):3100"
+  log "ORCHESTRATE started model=$MODEL assess=${ASSESS_INTERVAL}s poll=${POLL_INTERVAL}s (detached)"
+else
+  trap 'cleanup_all_groups' EXIT INT TERM HUP
+  orchestrate_loop
+fi

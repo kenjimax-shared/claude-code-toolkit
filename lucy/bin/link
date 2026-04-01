@@ -1,0 +1,6 @@
+#!/bin/bash
+# Output a clickable URL using OSC 8 terminal hyperlink escapes
+# Usage: link <url> [label]
+URL="$1"
+LABEL="${2:-$1}"
+printf '\e]8;;%s\e\\%s\e]8;;\e\\\n' "$URL" "$LABEL"
