@@ -75,10 +75,13 @@ crontab -l 2>/dev/null > "$REPO/crontab.example" || true
 sanitize_file() {
   local file="$1"
 
-  # Skip binary files
-  if ! file -b --mime-type "$file" 2>/dev/null | grep -q '^text/'; then
-    return 0
-  fi
+  # Skip binary files (allow text/*, application/json, application/javascript, etc.)
+  local mime
+  mime=$(file -b --mime-type "$file" 2>/dev/null)
+  case "$mime" in
+    text/*|application/json|application/javascript|application/x-shellscript) ;;
+    *) return 0 ;;
+  esac
 
   # Build sed command from patterns
   local sed_args=()
