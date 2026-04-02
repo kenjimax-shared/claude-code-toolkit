@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# toolkit-sync: One-way sync from live ~/.claude/ config to the sanitized public repo.
+# Copies infrastructure files, strips PII/credentials/company names, commits, and pushes.
+# Designed to run as a Stop hook (backgrounded) or manually.
+
+set -euo pipefail
+
+LIVE="$HOME/.claude"
+REPO="$HOME/Claude/claude-code-toolkit"
+PATTERNS_FILE="$LIVE/lucy/toolkit-sync-patterns.conf"
+LOCKFILE="/tmp/toolkit-sync.lock"
+TAG="[toolkit-sync]"
+
+# ── Guards ────────────────────────────────────────────────────────
+[[ -d "$REPO/.git" ]] || exit 0
+[[ -f "$PATTERNS_FILE" ]] || { echo "$TAG patterns file missing: $PATTERNS_FILE" >&2; exit 1; }
+
+# Prevent concurrent runs
+exec 9>"$LOCKFILE"
+flock -n 9 || { echo "$TAG already running, skipping" >&2; exit 0; }
+
+# Source patterns
+source "$PATTERNS_FILE"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $TAG $*"; }
+
+# ── Step 1: Copy files ────────────────────────────────────────────
+
+# lucy/bin/
+rsync -a --delete \
+  --exclude='*.log' --exclude='*.pid' --exclude='*.sock' \
+  "$LIVE/lucy/bin/" "$REPO/lucy/bin/"
+
+# hooks/
+rsync -a --delete \
+  --exclude='*.log' \
+  "$LIVE/hooks/" "$REPO/hooks/"
+
+# lucy config + docs
+cp -f "$LIVE/lucy/config.sh" "$REPO/lucy/config.sh"
+[[ -f "$LIVE/lucy/AGENTS.md" ]] && cp -f "$LIVE/lucy/AGENTS.md" "$REPO/lucy/AGENTS.md"
+
+# lucy/templates/
+[[ -d "$LIVE/lucy/templates" ]] && rsync -a --delete "$LIVE/lucy/templates/" "$REPO/lucy/templates/"
+
+# Simple skills (skip large/compiled ones)
+for skill_dir in "$LIVE/skills"/*/; do
+  [[ -d "$skill_dir" ]] || continue
+  skill_name=$(basename "$skill_dir")
+  skip=false
+  for s in "${SKIP_SKILLS[@]}"; do
+    [[ "$skill_name" == "$s" ]] && { skip=true; break; }
+  done
+  $skip && continue
+  mkdir -p "$REPO/skills/$skill_name"
+  rsync -a --delete \
+    --exclude='node_modules/' --exclude='dist/' --exclude='.git/' \
+    "$skill_dir" "$REPO/skills/$skill_name/"
+done
+
+# scripts/ (exclude uploads and large data)
+[[ -d "$LIVE/scripts" ]] && rsync -a --delete \
+  --exclude='uploads/' --exclude='*.log' \
+  "$LIVE/scripts/" "$REPO/scripts/" 2>/dev/null || true
+
+# settings.json -> config/settings.json
+mkdir -p "$REPO/config"
+cp -f "$LIVE/settings.json" "$REPO/config/settings.json"
+
+# crontab snapshot
+crontab -l 2>/dev/null > "$REPO/crontab.example" || true
+
+# ── Step 2: Sanitize ─────────────────────────────────────────────
+
+sanitize_file() {
+  local file="$1"
+
+  # Skip binary files
+  if ! file -b --mime-type "$file" 2>/dev/null | grep -q '^text/'; then
+    return 0
+  fi
+
+  # Build sed command from patterns
+  local sed_args=()
+  for pattern in "${SANITIZE_PATTERNS[@]}"; do
+    local search="${pattern%%|*}"
+    local replace="${pattern#*|}"
+    sed_args+=(-e "s|${search}|${replace}|g")
+  done
+
+  sed -i "${sed_args[@]}" "$file" 2>/dev/null || true
+}
+
+# Sanitize all text files in the repo (excluding .git)
+while IFS= read -r -d '' f; do
+  sanitize_file "$f"
+done < <(find "$REPO" -not -path '*/.git/*' -type f -print0)
+
+# ── Step 3: Commit & push if changed ─────────────────────────────
+
+cd "$REPO"
+
+# Check for changes
+if git diff --quiet HEAD 2>/dev/null && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+  exit 0
+fi
+
+# Stage all changes
+git add -A
+
+# Build a meaningful commit message from changed files
+changed=$(git diff --cached --name-only 2>/dev/null | head -5)
+summary=$(echo "$changed" | head -1)
+count=$(git diff --cached --name-only 2>/dev/null | wc -l)
+if [[ $count -gt 1 ]]; then
+  summary="$summary (+$((count - 1)) more)"
+fi
+
+git commit -m "$(cat <<EOF
+Auto-sync: $summary
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+EOF
+)"
+
+# Push in background so we don't block exit
+git push origin master >/dev/null 2>&1 &
+
+log "synced $count file(s)"

@@ -256,33 +256,116 @@ orchestrate_loop() {
       # Print human-readable summary of decisions
       print_assessment_summary
 
-      # Auto-archive terminal tasks with dead tmux sessions
+      # Auto-archive terminal tasks with dead tmux sessions (with enrichment)
       local archived=0
       archived=$(python3 -c "
-import json, subprocess, sys
+import json, subprocess, sys, fcntl, tempfile, os
+from pathlib import Path
+from datetime import datetime, timezone
+
 tf = '$TASKS_FILE'
 hf = '$HISTORY_FILE'
+lf = '$TASKS_FILE.lock'
+lucy = Path('$LUCY_DIR')
+
 try:
     tasks = json.load(open(tf))
 except: sys.exit(0)
 try:
     history = json.load(open(hf))
 except: history = []
+
+# Read assessments for enrichment
+assess_map = {}
+for f in lucy.glob('assessments-*.json'):
+    try:
+        data = json.load(open(f))
+        assess_map.update(data.get('assessments', {}))
+    except: pass
+
 active, archive = [], []
 for t in tasks:
     if t.get('status') in ('ready','merged','failed','killed'):
         r = subprocess.run(['tmux','has-session','-t',t.get('tmux','')], capture_output=True)
         if r.returncode != 0:
+            tid = t.get('id', '')
+            # Enrich with assessment/plan/done snapshots (match dashboard archive)
+            t['_assessment'] = assess_map.get(tid, {})
+            wt = t.get('worktree', '')
+            for tag, fname in [('_plan', '.lucy-plan.md'), ('_done', '.lucy-done.md')]:
+                for p in [Path(wt) / fname, lucy / 'tasks' / tid / fname]:
+                    try:
+                        t[tag] = {'summary': open(p).read()[:2000]}
+                        break
+                    except: pass
+                else:
+                    t[tag] = {}
+            t['_archived_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             archive.append(t)
             continue
     active.append(t)
+
 if archive:
     history.extend(archive)
-    json.dump(active, open(tf,'w'), indent=2)
-    json.dump(history, open(hf,'w'), indent=2)
+    # Atomic locked write (same pattern as dashboard)
+    with open(lf, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for data, path in [(history, hf), (active, tf)]:
+            fd, tmp = tempfile.mkstemp(dir=str(lucy), prefix=os.path.basename(path)+'.')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
 print(len(archive))
 " 2>/dev/null || echo 0)
       [ "$archived" -gt 0 ] && echo "[$(date '+%H:%M:%S')] Auto-archived $archived terminal task(s)"
+
+      # Phase 3B: Regenerate known-pitfalls.md from failure history
+      if [ "$archived" -gt 0 ]; then
+        python3 -c "
+import json, tempfile, os
+from pathlib import Path
+lucy = Path('$LUCY_DIR')
+hf = lucy / 'history.json'
+pitfalls_file = lucy / 'context' / 'known-pitfalls.md'
+try:
+    history = json.load(open(hf))
+except: history = []
+failed = [h for h in history if h.get('status') in ('failed','killed')][-50:]
+if not failed:
+    exit()
+lines = ['# Known Pitfalls (auto-generated from past failures)', '',
+         'Learn from these past failures. Avoid repeating the same mistakes.', '']
+by_group = {}
+for t in failed:
+    g = t.get('group', t.get('repo','')) or 'general'
+    by_group.setdefault(g, []).append(t)
+for group, tasks in sorted(by_group.items()):
+    lines.append(f'## {group}')
+    lines.append('')
+    for t in tasks[-10:]:
+        tid = t.get('id','?')
+        desc = (t.get('description','') or '')[:100]
+        a = t.get('_assessment',{})
+        d = t.get('_done',{})
+        summary = (a.get('summary','') or d.get('summary','') or '')[:200]
+        risks = a.get('risks',[])
+        if not summary and not risks: continue
+        lines.append(f'- **{tid}**: {desc}')
+        if summary: lines.append(f'  - Outcome: {summary}')
+        for r in risks[:2]: lines.append(f'  - Risk: {r}')
+    lines.append('')
+ctx_dir = lucy / 'context'
+ctx_dir.mkdir(exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=str(ctx_dir), prefix='known-pitfalls.')
+with os.fdopen(fd, 'w') as f:
+    f.write('\n'.join(lines))
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, str(pitfalls_file))
+" 2>/dev/null || true
+      fi
 
       # Clean up assessment files for groups with no remaining active tasks
       python3 -c "

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# lucy-cleanup: Remove finished worktrees, archive completed tasks, kill orphans
+# Run via daily cron: 0 3 * * * ~/.claude/lucy/bin/lucy-cleanup
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+TASKS=$(read_tasks)
+COUNT=$(echo "$TASKS" | jq 'length')
+ARCHIVED=0
+CLEANED=0
+
+echo "Lucy Cleanup"
+echo "  Total tasks: $COUNT"
+
+# Archive terminal-state tasks (merged, failed, killed) older than 24 hours
+NOW_EPOCH=$(date +%s)
+
+echo "$TASKS" | jq -c '.[]' | while IFS= read -r task; do
+  id=$(echo "$task" | jq -r '.id')
+  status=$(echo "$task" | jq -r '.status')
+  worktree=$(echo "$task" | jq -r '.worktree')
+  branch=$(echo "$task" | jq -r '.branch')
+  repo=$(echo "$task" | jq -r '.repo')
+  tmux_name=$(echo "$task" | jq -r '.tmux')
+  spawned=$(echo "$task" | jq -r '.spawned_at')
+
+  # Only clean terminal states
+  case "$status" in
+    merged|failed|killed) ;;
+    *) continue ;;
+  esac
+
+  # Check age (archive if older than 24 hours)
+  SPAWNED_EPOCH=$(date -d "$spawned" +%s 2>/dev/null || echo 0)
+  AGE=$(( NOW_EPOCH - SPAWNED_EPOCH ))
+  if [ "$AGE" -lt 86400 ]; then
+    continue
+  fi
+
+  echo "  Archiving: $id ($status, $(( AGE / 3600 ))h old)"
+
+  # Stop isolated Chrome session (merge data back to base first)
+  "$LUCY_BIN/chrome-session" stop "$id" --merge 2>/dev/null || true
+
+  # Kill tmux sessions if somehow still alive (worker, review, verify)
+  tmux kill-session -t "$tmux_name" 2>/dev/null || true
+  tmux kill-session -t "${TMUX_PREFIX}-r-${id}" 2>/dev/null || true
+  tmux kill-session -t "${TMUX_PREFIX}-v-${id}" 2>/dev/null || true
+  # Legacy prefix cleanup
+  tmux kill-session -t "${TMUX_PREFIX}-review-${id}" 2>/dev/null || true
+
+  task_type=$(echo "$task" | jq -r '.type // "feature"')
+
+  if [ "$task_type" = "ops" ]; then
+    # Ops tasks: remove the task metadata directory
+    OPS_DIR="$LUCY_DIR/tasks/${id}"
+    if [ -d "$OPS_DIR" ]; then
+      rm -rf "$OPS_DIR"
+      echo "    Removed ops task dir"
+    fi
+  else
+    # Code tasks: remove worktree
+    REPO_DIR="$WORKTREE_ROOT/$repo"
+    if [ -d "$worktree" ]; then
+      git -C "$REPO_DIR" worktree remove "$worktree" --force 2>/dev/null || rm -rf "$worktree"
+      echo "    Removed worktree"
+    fi
+
+    # Delete local branch (only if merged or killed, keep failed for debugging)
+    if [ "$status" = "merged" ] || [ "$status" = "killed" ]; then
+      git -C "$REPO_DIR" branch -D "$branch" 2>/dev/null || true
+      echo "    Deleted branch"
+    fi
+  fi
+
+  # Remove log files
+  rm -f "$LUCY_DIR/logs/${id}.log" "$LUCY_DIR/logs/${id}-review.log" "$LUCY_DIR/logs/${id}-verify.log" 2>/dev/null || true
+
+  # Append to history
+  if [ -f "$HISTORY_FILE" ]; then
+    HIST=$(cat "$HISTORY_FILE")
+  else
+    HIST="[]"
+  fi
+  ARCHIVED_TASK=$(echo "$task" | jq ". + {\"archived_at\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}")
+  echo "$HIST" | jq ". + [$ARCHIVED_TASK]" > "$HISTORY_FILE"
+
+  # Remove from active tasks
+  # Remove from active tasks (locked, using --arg for safe ID handling)
+  (
+    flock -x 200
+    read_tasks | jq --arg tid "$id" '[.[] | select(.id != $tid)]' | write_tasks
+  ) 200>"$TASKS_LOCK"
+
+  echo "    Archived to history.json"
+done
+
+# Clean orphaned worktree directories (no matching task)
+for wt_dir in "$WORKTREE_ROOT"/*-worktrees/*/; do
+  [ -d "$wt_dir" ] || continue
+  wt_name=$(basename "$wt_dir")
+  if ! jq -e ".[] | select(.id == \"$wt_name\")" "$TASKS_FILE" >/dev/null 2>&1; then
+    echo "  Orphaned worktree: $wt_dir"
+    # Find the parent repo
+    PARENT_REPO=$(basename "$(dirname "$wt_dir")" | sed 's/-worktrees$//')
+    PARENT_DIR="$WORKTREE_ROOT/$PARENT_REPO"
+    if [ -d "$PARENT_DIR/.git" ]; then
+      git -C "$PARENT_DIR" worktree remove "$wt_dir" --force 2>/dev/null || rm -rf "$wt_dir"
+    else
+      rm -rf "$wt_dir"
+    fi
+    echo "    Removed"
+  fi
+done
+
+# Clean empty worktree parent directories
+for wt_parent in "$WORKTREE_ROOT"/*-worktrees; do
+  [ -d "$wt_parent" ] || continue
+  if [ -z "$(ls -A "$wt_parent" 2>/dev/null)" ]; then
+    rmdir "$wt_parent" 2>/dev/null || true
+  fi
+done
+
+# Kill orphaned lucy- tmux sessions (no matching task)
+tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${TMUX_PREFIX}-" | while read -r session; do
+  # Skip the orchestrator
+  [ "$session" = "lucy-orchestrate" ] && continue
+
+  # Strip prefix and type marker to get task ID
+  TASK_SUFFIX="${session#${TMUX_PREFIX}-}"
+  # Remove type prefixes: w-, r-, v-, review-
+  TASK_SUFFIX="${TASK_SUFFIX#w-}"
+  TASK_SUFFIX="${TASK_SUFFIX#r-}"
+  TASK_SUFFIX="${TASK_SUFFIX#v-}"
+  TASK_SUFFIX="${TASK_SUFFIX#review-}"
+
+  if ! jq -e ".[] | select(.id == \"$TASK_SUFFIX\")" "$TASKS_FILE" >/dev/null 2>&1; then
+    echo "  Orphaned tmux session: $session"
+    tmux kill-session -t "$session" 2>/dev/null || true
+    echo "    Killed"
+  fi
+done
+
+log "CLEANUP complete"
+echo "Done."

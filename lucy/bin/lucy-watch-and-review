@@ -65,7 +65,7 @@ while true; do
     case "$status" in
       ready|reviewing|pr_open|pr_merged)
         if [ -n "$pr" ]; then
-          echo "[$(date '+%H:%M:%S')] $task_id has PR #$pr (status: $status), launching review..."
+          echo "[$(date '+%H:%M:%S')] $task_id has PR #$pr (status: $status), launching GPT-5.4 review..."
           lucy-review "$task_id" 2>&1
           PENDING_NOTIFY+=("$task_id")
         fi
@@ -98,7 +98,7 @@ while true; do
 
   if [ "$real_completed" -eq "${#TASK_IDS[@]}" ]; then
     echo "[$(date '+%H:%M:%S')] All tasks reviewed!"
-    notify "Lucy Reviews Done" "All ${#TASK_IDS[@]} fix PRs have been reviewed. Ready for merge."
+    notify "Lucy Reviews Done" "All ${#TASK_IDS[@]} fix PRs have been reviewed by GPT-5.4. Ready for merge."
     break
   fi
 

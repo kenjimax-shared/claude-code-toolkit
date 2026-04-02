@@ -11,3 +11,5 @@ credentials.json
 serviceaccount.json
 token.json
 *.enc
+.sync.log
+toolkit-sync-patterns.conf

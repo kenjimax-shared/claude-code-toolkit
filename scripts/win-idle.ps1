@@ -1,7 +1,3 @@
-## Windows idle time detection (used by notification cascade)
-## Returns the number of seconds since last user input (mouse/keyboard)
-## Called from WSL via: powershell.exe -File win-idle.ps1
-
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;

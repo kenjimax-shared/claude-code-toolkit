@@ -1,17 +1,18 @@
-# Claude Code Toolkit - Example Crontab Entries
-# Add these with: crontab -e
-
-# Save agent-browser session state every 2 minutes (crash safety net)
-*/2 * * * * $HOME/.claude/lucy/bin/agent-browser-state-save >> $HOME/.agent-browser/state-save.log 2>&1
-
-# Auto-update agent-browser weekly
-0 4 * * 0 /usr/bin/npm install -g agent-browser@latest >> $HOME/.agent-browser/auto-update.log 2>&1
-
-# Lucy monitor: check agent status every 5 minutes (optional, for multi-agent use)
-# */5 * * * * $HOME/.claude/lucy/bin/lucy-monitor >> $HOME/.claude/lucy/monitor.log 2>&1
-
-# Lucy assess: periodic orchestrator assessment (optional, for multi-agent use)
-# */5 * * * * $HOME/.claude/lucy/bin/lucy-assess >> $HOME/.claude/lucy/assess.log 2>&1
-
-# Workspace token health check (optional, for Google Workspace MCP)
-# 0 * * * * bash $HOME/.claude/hooks/workspace-token-check.sh >> $HOME/.claude/hooks/workspace-token-check.log 2>&1
+*/10 * * * * /usr/bin/python3 /home/kenji/Claude/totp-ext/bridge/totp-bridge.py --rebuild-cache > /dev/null 2>&1
+*/2 * * * * /home/kenji/.claude/lucy/bin/agent-browser-state-save >> /home/kenji/.agent-browser/state-save.log 2>&1
+0 4 * * 0 /usr/bin/npm install -g agent-browser@latest >> /home/kenji/.agent-browser/auto-update.log 2>&1
+# Claude snooze: ClientFODS conversion tracking audit, SF OAuth fix, Cloud Function deploy
+0 9 1 4 * /home/kenji/.claude/snooze-resume.sh de001bfb-da72-4607-94bc-e2edd9c2866e "ClientFODS conversion tracking audit - SF OAuth fix deployed, verify 7am run and continue GTM cleanup" "tmux-name-sync-issue"
+# Claude snooze: FodCheck server-side tracking, enhanced conversions, cross-domain published
+0 9 3 4 * /home/kenji/.claude/snooze-resume.sh ef3912fb-2754-4824-84f3-27de56939ec4 "FodCheck server-side tracking, enhanced conversions, cross-domain published" "fodcheck-server-side-gtm"
+# Claude snooze: Thumbtack webhook deploy - finish after org policy fix
+0 10 1 4 * /home/kenji/.claude/snooze-resume.sh 07c13e18-4cf2-4b6e-81eb-8e597b2ecd0b "Thumbtack webhook deploy: org policy unblocked, set FUNCTION_URL, complete OAuth, register webhook, wire Zendesk Sell" "exampleco-thumbtack-conversion-tr"
+# Claude snooze: Quote flow CRO - Vercel preview live, 22 fixes to implement
+0 9 1 4 * /home/kenji/.claude/snooze-resume.sh 98f61ea9-8dc6-4801-9b31-95af89dc0658 "Quote flow CRO - Vercel preview live, user reviewing, 22 fixes to implement" "pull-session-redesigning-quote"
+# Claude snooze: Customer message audit nurture plan
+0 9 1 4 * /home/kenji/.claude/snooze-resume.sh ab290290-e755-4646-beb3-a6234a5b5c01 "Customer message audit: nurture plan in Notion, ready for review and Zapier build" "customer-message-audit"
+# Claude snooze: Drillbit A/B test implementation
+0 9 1 4 * /home/kenji/.claude/snooze-resume.sh ab290290-e755-4646-beb3-a6234a5b5c01 "Drillbit A/B test implementation checklist for ExampleCo" "drill-bit-testing-plan"
+*/30 * * * * /home/kenji/.claude/lucy/bin/agent-browser-reap-orphans >> /home/kenji/.agent-browser/reap-orphans.log 2>&1
+# MCP health check: validate npm packages weekly (Sundays 3am)
+0 3 * * 0 /home/kenji/.claude/mcp-health-check --quiet >> /home/kenji/.claude/mcp-health-check.log 2>&1

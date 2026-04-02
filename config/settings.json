@@ -2,13 +2,20 @@
   "permissions": {
     "allow": [
       "Bash(code:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(/home/kenji/.local/bin/uvx --from workspace-mcp workspace-mcp --help)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(k\\) for k in d.get\\(''''mcpServers'''',{}\\)]\")",
+      "Bash(~/.claude/skills/gstack/browse/dist/browse navigate:*)",
       "Bash(gh repo:*)",
       "WebSearch",
+      "mcp__github__search_repositories",
       "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.browser-use.com)",
+      "WebFetch(domain:docs.browserbase.com)",
+      "WebFetch(domain:docs.stagehand.dev)",
       "Bash(gh api:*)",
       "Bash(gh issue:*)",
-      "mcp__github__get_file_contents",
-      "mcp__github__search_repositories"
+      "mcp__github__get_file_contents"
     ],
     "defaultMode": "dontAsk"
   },
@@ -40,14 +47,34 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash \"$HOME/Claude/claude-code-toolkit/hooks/bash-injection-guard.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/zapier-title-check.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "bash \"$HOME/.claude/hooks/no-gstack-login.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/disk-check.sh\"",
+            "command": "bash \"$HOME/.claude/disk-check.sh\"",
             "timeout": 5,
             "statusMessage": "Checking disk space..."
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__chrome-devtools__evaluate_script",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/zapier-title-check.sh\"",
+            "timeout": 5
           }
         ]
       },
@@ -60,15 +87,50 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "mcp__google-sheets-deep__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/workspace-token-gate.sh\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "ToolSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/mcp-tool-not-found.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "mcp__chrome.devtools__",
         "hooks": [
           {
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/chrome-tab-track.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/headless-blocked-hint.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/verification-code-hint.sh\"",
             "timeout": 5
           }
         ]
@@ -124,6 +186,16 @@
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/notify-stop-debounce.sh\"",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/cleanup-owner.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash -c '\"$HOME/.claude/lucy/bin/toolkit-sync\" &'",
+            "timeout": 5
           }
         ]
       }
@@ -131,5 +203,6 @@
   },
   "enabledPlugins": {},
   "effortLevel": "high",
+  "skipDangerousModePermissionPrompt": true,
   "autoUpdatesChannel": "stable"
 }

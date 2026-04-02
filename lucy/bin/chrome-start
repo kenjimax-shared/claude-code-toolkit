@@ -17,7 +17,7 @@
 set -euo pipefail
 
 PORT=9222
-WIN_PROFILE='C:\Users\YOUR_USER\.claude\chrome-debug-profile'
+WIN_PROFILE='C:\Users\winuser\.claude\chrome-debug-profile'
 CHROME_EXE='C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
 POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 

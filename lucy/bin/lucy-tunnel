@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# lucy-tunnel: Persistent Cloudflare quick tunnel for the Lucy FastAPI dashboard.
+#
+# Runs cloudflared in an infinite loop. On each (re)start:
+#   1. Launches cloudflared tunnel -> http://127.0.0.1:3100
+#   2. Waits for the trycloudflare.com URL to appear in output
+#   3. Writes the URL to ~/.claude/lucy/.tunnel-url
+#   4. Updates the Vercel LUCY_API_URL env var (production)
+#   5. Triggers a production redeploy
+#   6. If cloudflared exits, loops back to step 1
+#
+# Usage:
+#   lucy-tunnel              # Run in foreground (intended for tmux)
+#   lucy-tunnel start        # Same as above
+#   lucy-tunnel stop         # Kill running tunnel + tmux session
+#   lucy-tunnel url          # Print current tunnel URL
+#   lucy-tunnel tmux         # Start in a tmux session called lucy-tunnel
+
+set -uo pipefail
+
+CLOUDFLARED="$HOME/.local/bin/cloudflared"
+TUNNEL_LOG="$HOME/.claude/lucy/.tunnel.log"
+TUNNEL_URL_FILE="$HOME/.claude/lucy/.tunnel-url"
+TUNNEL_PID_FILE="$HOME/.claude/lucy/.tunnel.pid"
+VERCEL_PROJECT="$HOME/Claude/lucy-dashboard"
+LOCAL_PORT="${LUCY_DASHBOARD_PORT:-3100}"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" | tee -a "$TUNNEL_LOG"
+}
+
+update_vercel() {
+  local url="$1"
+  if ! command -v vercel &>/dev/null; then
+    log "WARN: vercel CLI not found, skipping env update"
+    return 1
+  fi
+
+  log "Updating Vercel LUCY_API_URL to: $url"
+  (
+    cd "$VERCEL_PROJECT"
+    vercel env rm LUCY_API_URL production -y 2>/dev/null || true
+    printf '%s' "$url" | vercel env add LUCY_API_URL production 2>/dev/null
+  )
+
+  log "Triggering Vercel production redeploy..."
+  (
+    cd "$VERCEL_PROJECT"
+    vercel deploy --prod --no-wait 2>&1 | tee -a "$TUNNEL_LOG"
+  )
+
+  log "Vercel updated and redeploy triggered."
+}
+
+run_tunnel_loop() {
+  log "=== Lucy tunnel loop starting ==="
+
+  while true; do
+    # Clean up stale PID file
+    rm -f "$TUNNEL_PID_FILE"
+
+    # Truncate the per-run portion of the log (keep the loop-level messages)
+    local run_log
+    run_log=$(mktemp)
+
+    log "Starting cloudflared tunnel to localhost:${LOCAL_PORT}..."
+
+    # Launch cloudflared, capturing output to both the run log and main log
+    "$CLOUDFLARED" tunnel --url "http://127.0.0.1:${LOCAL_PORT}" > "$run_log" 2>&1 &
+    local cf_pid=$!
+    echo "$cf_pid" > "$TUNNEL_PID_FILE"
+    log "cloudflared PID: $cf_pid"
+
+    # Tail the run log into the main log in the background
+    tail -f "$run_log" >> "$TUNNEL_LOG" 2>/dev/null &
+    local tail_pid=$!
+
+    # Wait for the URL to appear (up to 30s)
+    local tunnel_url=""
+    for i in $(seq 1 30); do
+      if ! kill -0 "$cf_pid" 2>/dev/null; then
+        log "ERROR: cloudflared exited prematurely"
+        break
+      fi
+      tunnel_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$run_log" 2>/dev/null | head -1)
+      if [[ -n "$tunnel_url" ]]; then
+        break
+      fi
+      sleep 1
+    done
+
+    # Kill the tail process
+    kill "$tail_pid" 2>/dev/null
+    rm -f "$run_log"
+
+    if [[ -n "$tunnel_url" ]]; then
+      echo "$tunnel_url" > "$TUNNEL_URL_FILE"
+      log "Tunnel live: $tunnel_url"
+      update_vercel "$tunnel_url"
+    else
+      log "ERROR: Failed to obtain tunnel URL within 30s"
+    fi
+
+    # Wait for cloudflared to exit (it will eventually, quick tunnels are ephemeral)
+    log "Waiting for cloudflared (PID $cf_pid) to exit..."
+    wait "$cf_pid" 2>/dev/null
+    local exit_code=$?
+    log "cloudflared exited with code $exit_code"
+
+    rm -f "$TUNNEL_PID_FILE"
+    log "Restarting in 5 seconds..."
+    sleep 5
+  done
+}
+
+case "${1:-start}" in
+  start)
+    run_tunnel_loop
+    ;;
+
+  tmux)
+    # Kill existing tmux session if present
+    tmux kill-session -t lucy-tunnel 2>/dev/null || true
+    # Kill any lingering cloudflared
+    if [[ -f "$TUNNEL_PID_FILE" ]]; then
+      kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true
+      rm -f "$TUNNEL_PID_FILE"
+    fi
+    pkill -f 'cloudflared tunnel' 2>/dev/null || true
+    sleep 1
+    # Start in tmux
+    tmux new-session -d -s lucy-tunnel "$0 start"
+    echo "Started lucy-tunnel tmux session. Attach with: tmux attach -t lucy-tunnel"
+    ;;
+
+  stop)
+    if [[ -f "$TUNNEL_PID_FILE" ]]; then
+      kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null && log "Tunnel process killed" || log "Tunnel not running"
+      rm -f "$TUNNEL_PID_FILE"
+    fi
+    tmux kill-session -t lucy-tunnel 2>/dev/null && echo "tmux session killed" || echo "No tmux session"
+    rm -f "$TUNNEL_URL_FILE"
+    ;;
+
+  url)
+    cat "$TUNNEL_URL_FILE" 2>/dev/null || echo "No tunnel URL found"
+    ;;
+
+  *)
+    echo "Usage: lucy-tunnel [start|stop|url|tmux]"
+    exit 1
+    ;;
+esac

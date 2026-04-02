@@ -29,7 +29,7 @@ fi
 
 # Find transcript file
 TRANSCRIPT=""
-for dir in "$HOME/.claude/projects/-home-YOUR_USER-PROJECT" "$HOME/.claude/projects/-mnt-c-Users-YOUR_USER-PROJECT"; do
+for dir in "$HOME/.claude/projects/-home-user-Claude" "$HOME/.claude/projects/-mnt-c-Users-user-Claude"; do
   if [ -f "$dir/${SESSION_ID}.jsonl" ]; then
     TRANSCRIPT="$dir/${SESSION_ID}.jsonl"
     break

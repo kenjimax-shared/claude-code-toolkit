@@ -64,7 +64,7 @@ FEED_FILE="$LUCY_DIR/orchestrator-feed.jsonl"
 feed_write() {
   local type="$1" msg="$2" task="${3:-}"
   local ts
-  ts=$(date '+%H:%M:%S')
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   if [ -n "$task" ]; then
     jq -nc --arg ts "$ts" --arg type "$type" --arg task "$task" --arg msg "$msg" \
       '{ts:$ts,type:$type,task:$task,msg:$msg}' >> "$FEED_FILE"
@@ -72,11 +72,17 @@ feed_write() {
     jq -nc --arg ts "$ts" --arg type "$type" --arg msg "$msg" \
       '{ts:$ts,type:$type,msg:$msg}' >> "$FEED_FILE"
   fi
-  # Trim to last 200 entries when it grows too large
+  # Trim to last 200 entries when it grows too large (locked, unique temp)
   local lines
   lines=$(wc -l < "$FEED_FILE" 2>/dev/null || echo 0)
   if [ "$lines" -gt 300 ]; then
-    tail -200 "$FEED_FILE" > "$FEED_FILE.tmp" && mv "$FEED_FILE.tmp" "$FEED_FILE"
+    local trim_tmp
+    trim_tmp=$(mktemp "$FEED_FILE.XXXXXX")
+    (
+      flock -x 200
+      tail -200 "$FEED_FILE" > "$trim_tmp" && mv "$trim_tmp" "$FEED_FILE"
+    ) 200>"$FEED_FILE.lock"
+    rm -f "$trim_tmp" 2>/dev/null || true  # cleanup if mv succeeded and tmp is gone
   fi
 }
 
@@ -274,6 +280,104 @@ gather_state() {
       fi
     fi
 
+    # ── Diagnostic signals (Phase 3A: smarter assessment) ──────────
+    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+      # 1. Token velocity: tokens per minute since spawn
+      local token_velocity=""
+      if [ -n "$(echo "$task" | jq -r '.spawned_at // empty')" ]; then
+        token_velocity=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+spawned = '$(echo "$task" | jq -r '.spawned_at')'
+try:
+    dt = datetime.fromisoformat(spawned.replace('Z','+00:00'))
+    mins = max(1, (datetime.now(timezone.utc) - dt).total_seconds() / 60)
+    total_in = total_out = 0
+    with open('$log_file') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                r = json.loads(line)
+            except: continue
+            if r.get('type') != 'assistant': continue
+            u = r.get('message',{}).get('usage',{})
+            total_in += u.get('input_tokens',0)
+            total_out += u.get('output_tokens',0)
+    total = total_in + total_out
+    if total > 0:
+        print(f'{int(total/mins)} tok/min ({total_in:,} in, {total_out:,} out over {int(mins)}min)')
+except: pass
+" 2>/dev/null)
+      fi
+      if [ -n "$token_velocity" ]; then
+        echo "- **Token velocity:** $token_velocity"
+      fi
+
+      # 2. Repeated tool calls: flag if same tool used >10 times in last 50 entries
+      local repeated_tools=""
+      repeated_tools=$(python3 -c "
+import json
+from collections import Counter
+tools = Counter()
+count = 0
+with open('$log_file') as f:
+    lines = f.readlines()
+for line in lines[-200:]:
+    line = line.strip()
+    if not line: continue
+    try:
+        r = json.loads(line)
+    except: continue
+    if r.get('type') != 'assistant': continue
+    for c in r.get('message',{}).get('content',[]):
+        if c.get('type') == 'tool_use':
+            tools[c['name']] += 1
+            count += 1
+    if count >= 50: break
+repeated = [(t,n) for t,n in tools.most_common(5) if n >= 10]
+if repeated:
+    print(', '.join(f'{t} x{n}' for t,n in repeated))
+" 2>/dev/null)
+      if [ -n "$repeated_tools" ]; then
+        echo "- **REPEATED TOOLS (possible loop):** $repeated_tools"
+      fi
+
+      # 3. Repeated errors: same error appearing >3 times in recent results
+      local repeated_errors=""
+      repeated_errors=$(python3 -c "
+import json, re
+from collections import Counter
+errors = Counter()
+with open('$log_file') as f:
+    lines = f.readlines()
+for line in lines[-100:]:
+    line = line.strip()
+    if not line: continue
+    try:
+        r = json.loads(line)
+    except: continue
+    if r.get('type') != 'result': continue
+    content = str(r.get('content',''))
+    if any(w in content.lower() for w in ['error','failed','denied','refused','timeout','exception','traceback']):
+        # Normalize: take first 80 chars after error keyword
+        m = re.search(r'(?i)(error|failed|denied|refused|timeout|exception)[:\s]*(.*)', content)
+        if m:
+            key = m.group(0)[:80].strip()
+            errors[key] += 1
+repeated = [(e,n) for e,n in errors.most_common(3) if n >= 3]
+if repeated:
+    for e,n in repeated:
+        print(f'{n}x: {e}')
+" 2>/dev/null)
+      if [ -n "$repeated_errors" ]; then
+        echo "- **REPEATED ERRORS:**"
+        echo '```'
+        echo "$repeated_errors"
+        echo '```'
+      fi
+    fi
+
     # Live tmux pane snapshot (if alive and running)
     if [ "$alive" = "alive" ] && [ "$status" = "running" ]; then
       local pane
@@ -323,21 +427,21 @@ gather_context() {
   # Map group names to context files
   for grp in $active_groups; do
     case "$grp" in
-      myproject)
-        # Include all myproject context modules
-        for f in "$LUCY_DIR/context"/myproject*.md; do
+      exampleco)
+        # Include all exampleco context modules
+        for f in "$LUCY_DIR/context"/exampleco*.md; do
           [ -f "$f" ] && cat "$f" && echo ""
         done
         ;;
-      client1)   [ -f "$LUCY_DIR/context/client1.md" ] && cat "$LUCY_DIR/context/client1.md" && echo "" ;;
-      client2)    [ -f "$LUCY_DIR/context/client2.md" ] && cat "$LUCY_DIR/context/client2.md" && echo "" ;;
-      client3)      [ -f "$LUCY_DIR/context/client3.md" ] && cat "$LUCY_DIR/context/client3.md" && echo "" ;;
-      agency) [ -f "$LUCY_DIR/context/agency.md" ] && cat "$LUCY_DIR/context/agency.md" && echo "" ;;
-      client4) [ -f "$LUCY_DIR/context/client4.md" ] && cat "$LUCY_DIR/context/client4.md" && echo "" ;;
-      client5) [ -f "$LUCY_DIR/context/client5.md" ] && cat "$LUCY_DIR/context/client5.md" && echo "" ;;
-      client6) [ -f "$LUCY_DIR/context/client6.md" ] && cat "$LUCY_DIR/context/client6.md" && echo "" ;;
-      client7)    [ -f "$LUCY_DIR/context/client7.md" ] && cat "$LUCY_DIR/context/client7.md" && echo "" ;;
-      client8) [ -f "$LUCY_DIR/context/client8.md" ] && cat "$LUCY_DIR/context/client8.md" && echo "" ;;
+      premier)   [ -f "$LUCY_DIR/context/premier.md" ] && cat "$LUCY_DIR/context/premier.md" && echo "" ;;
+      clientsplash)    [ -f "$LUCY_DIR/context/clientsplash.md" ] && cat "$LUCY_DIR/context/clientsplash.md" && echo "" ;;
+      fods)      [ -f "$LUCY_DIR/context/fods.md" ] && cat "$LUCY_DIR/context/fods.md" && echo "" ;;
+      agencyco) [ -f "$LUCY_DIR/context/agencyco.md" ] && cat "$LUCY_DIR/context/agencyco.md" && echo "" ;;
+      spartanmat) [ -f "$LUCY_DIR/context/spartanmat.md" ] && cat "$LUCY_DIR/context/spartanmat.md" && echo "" ;;
+      client-composites) [ -f "$LUCY_DIR/context/client-composites.md" ] && cat "$LUCY_DIR/context/client-composites.md" && echo "" ;;
+      smartsleeve) [ -f "$LUCY_DIR/context/smartsleeve.md" ] && cat "$LUCY_DIR/context/smartsleeve.md" && echo "" ;;
+      client-paloma)    [ -f "$LUCY_DIR/context/client-paloma.md" ] && cat "$LUCY_DIR/context/client-paloma.md" && echo "" ;;
+      client-health) [ -f "$LUCY_DIR/context/client-health.md" ] && cat "$LUCY_DIR/context/client-health.md" && echo "" ;;
       personal)  ;; # No business context for personal projects
       default)
         # For unknown groups, include shared only (already done above)
@@ -365,6 +469,15 @@ For each agent, evaluate:
 5. **Does it need user input?** Some decisions only the human can make.
 6. **Is it blocked by an access gate it could bypass?** See below.
 
+## Diagnostic Signals (auto-detected)
+
+The state below may include these automatically detected signals:
+- **Token velocity**: tokens consumed per minute. High burn (>5000 tok/min sustained) suggests the agent is thrashing.
+- **REPEATED TOOLS**: If the same tool appears 10+ times in the last 50 tool calls, the agent may be looping.
+- **REPEATED ERRORS**: If the same error appears 3+ times, the agent is likely stuck on the same obstacle.
+
+When you see these signals, incorporate them into your verdict. A high token velocity + repeated tools is a strong indicator of a stuck agent that should be redirected or killed.
+
 ## Access Gate Detection (CRITICAL)
 
 Agents often hit auth gates and give up. You MUST detect these patterns and redirect:
@@ -377,10 +490,10 @@ Agents often hit auth gates and give up. You MUST detect these patterns and redi
 
 **Available access methods agents should use:**
 - `pp <service>` (Proton Pass CLI): Look up any stored password, TOTP code, or credential
-- `agent-browser`: Persistent browser profiles with saved logins for: zapier-myproject, gtm, nextdoor, qbo
+- `agent-browser`: Persistent browser profiles with saved logins for: zapier-exampleco, gtm, nextdoor, qbo
 - API tokens in environment: ZENDESK_SUPPORT_TOKEN, ZENDESK_SELL_TOKEN, CALLRAIL_API_KEY
 - `gh` CLI for GitHub (pre-authenticated)
-- `bq` CLI for BigQuery (project: myproject-cac)
+- `bq` CLI for BigQuery (project: example-project)
 - For Notion: use `pp notion -a` to get credentials, then `agent-browser` to read pages
 
 **When you detect an auth-gate block:**
@@ -457,6 +570,20 @@ PROMPT_HEADER
     echo "---"
     echo ""
     echo "$context"
+  fi
+
+  # Known pitfalls (orchestrator's cross-cycle memory)
+  local pitfalls_file="$LUCY_DIR/context/known-pitfalls.md"
+  if [ -f "$pitfalls_file" ] && [ -s "$pitfalls_file" ]; then
+    echo ""
+    echo "---"
+    echo ""
+    echo "# Lessons from Past Failures"
+    echo ""
+    echo "These patterns have caused agent failures before. Use this to make faster, better intervention decisions."
+    echo "If you see an agent heading toward a known failure mode, intervene earlier rather than later."
+    echo ""
+    cat "$pitfalls_file"
   fi
 
   # Agent state
@@ -602,6 +729,9 @@ if start >= 0 and end > start:
     group_ids_json=$(echo "$group_task_ids" | jq -R -s 'split("\n") | map(select(length > 0))')
     interventions=$(echo "$json_response" | jq --argjson ids "$group_ids_json" '[.interventions // [] | .[] | select(.task_id as $tid | $ids | index($tid))]' 2>/dev/null || echo "[]")
 
+    # Write atomically (readers may be mid-read)
+    local assess_tmp
+    assess_tmp=$(mktemp "$group_file.XXXXXX")
     jq -n \
       --arg ts "$timestamp" \
       --arg sum "$summary" \
@@ -609,13 +739,17 @@ if start >= 0 and end > start:
       --argjson iv "$interventions" \
       --argjson assess "$group_assessments" \
       '{timestamp: $ts, summary: $sum, needs_input: $ni, interventions: $iv, assessments: $assess}' \
-      > "$group_file"
+      > "$assess_tmp"
+    mv "$assess_tmp" "$group_file"
 
     log "ASSESS wrote $group_file"
   done
 
-  # Also write the legacy assessments.json for backward compat
-  echo "$json_response" > "$LUCY_DIR/assessments.json"
+  # Also write the legacy assessments.json for backward compat (atomic)
+  local legacy_tmp
+  legacy_tmp=$(mktemp "$LUCY_DIR/assessments.json.XXXXXX")
+  echo "$json_response" > "$legacy_tmp"
+  mv "$legacy_tmp" "$LUCY_DIR/assessments.json"
 
   # ── Execute interventions ─────────────────────────────────────────
   local intervention_count
@@ -635,17 +769,86 @@ if start >= 0 and end > start:
         redirect)
           log "ASSESS intervention: redirecting $task_id"
           feed_write "intervention" "[$severity] Redirecting: $message" "$task_id"
-          # If redirect is auth-related, append full tools-and-access reference
           local redirect_msg="$message"
+
+          # Phase 3D: Auto-context enrichment
+          # Detect service-specific stuck patterns and inject relevant context
+          local task_group=""
+          task_group=$(echo "$tasks" | jq -r --arg tid "$task_id" '.[] | select(.id == $tid) | .group // "default"')
+
+          # Service-specific context injection
+          local extra_context=""
+          if echo "$message" | grep -qiE 'zapier|zap |automation'; then
+            [ -f "$LUCY_DIR/context/exampleco-zapier.md" ] && extra_context="$LUCY_DIR/context/exampleco-zapier.md"
+          elif echo "$message" | grep -qiE 'GTM|tag.manager|container|gtm-'; then
+            [ -f "$LUCY_DIR/context/exampleco-gtm.md" ] && extra_context="$LUCY_DIR/context/exampleco-gtm.md"
+          elif echo "$message" | grep -qiE 'google.ads|adwords|campaign|ad.group|keyword'; then
+            [ -f "$LUCY_DIR/context/exampleco-ads.md" ] && extra_context="$LUCY_DIR/context/exampleco-ads.md"
+          elif echo "$message" | grep -qiE 'zendesk|ticket|CRM|deal|pipeline'; then
+            [ -f "$LUCY_DIR/context/exampleco-crm.md" ] && extra_context="$LUCY_DIR/context/exampleco-crm.md"
+          elif echo "$message" | grep -qiE 'bigquery|BQ |dataset|query'; then
+            [ -f "$LUCY_DIR/context/exampleco-dashboard-bq-schema.md" ] && extra_context="$LUCY_DIR/context/exampleco-dashboard-bq-schema.md"
+          elif echo "$message" | grep -qiE 'pricing|quote|estimate'; then
+            [ -f "$LUCY_DIR/context/exampleco-pricing.md" ] && extra_context="$LUCY_DIR/context/exampleco-pricing.md"
+          fi
+
+          # If a group-specific context exists and no service match, inject general group context
+          if [ -z "$extra_context" ] && [ -n "$task_group" ] && [ "$task_group" != "default" ]; then
+            if [ -f "$LUCY_DIR/context/${task_group}.md" ]; then
+              extra_context="$LUCY_DIR/context/${task_group}.md"
+            fi
+          fi
+
+          if [ -n "$extra_context" ] && [ -f "$extra_context" ]; then
+            local ctx_name
+            ctx_name=$(basename "$extra_context")
+            redirect_msg="$message
+
+--- RELEVANT CONTEXT ($ctx_name) ---
+$(cat "$extra_context")"
+            feed_write "context" "Auto-injected $ctx_name" "$task_id"
+          fi
+
+          # If redirect is auth-related, also append tools-and-access reference
           if echo "$message" | grep -qiE 'auth|sign.in|login|credential|password|notion|403|401|access.denied|pp |agent-browser'; then
             local tools_ref="$LUCY_DIR/context/tools-and-access.md"
             if [ -f "$tools_ref" ]; then
-              redirect_msg="$message
+              redirect_msg="$redirect_msg
 
 --- TOOLS & ACCESS REFERENCE ---
 $(cat "$tools_ref")"
             fi
           fi
+
+          # Inject known pitfalls if they exist
+          local pitfalls_file="$LUCY_DIR/context/known-pitfalls.md"
+          if [ -f "$pitfalls_file" ] && [ -s "$pitfalls_file" ]; then
+            # Filter pitfalls relevant to this task's group
+            local relevant_pitfalls=""
+            relevant_pitfalls=$(python3 -c "
+import sys
+group = '$task_group'
+lines = open('$pitfalls_file').readlines()
+relevant = []
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith('#'): continue
+    # Include if it mentions the group or is general
+    if group and group.lower() in line.lower():
+        relevant.append(line)
+    elif 'all groups' in line.lower() or line.startswith('- '):
+        relevant.append(line)
+if relevant:
+    print('\n'.join(relevant[:10]))
+" 2>/dev/null)
+            if [ -n "$relevant_pitfalls" ]; then
+              redirect_msg="$redirect_msg
+
+--- KNOWN PITFALLS (learn from past failures) ---
+$relevant_pitfalls"
+            fi
+          fi
+
           "$SCRIPT_DIR/lucy-redirect" "$task_id" "$redirect_msg" 2>/dev/null || true
           ;;
         kill)
@@ -674,6 +877,74 @@ $(cat "$tools_ref")"
   if [ "$critical_needs" -gt 0 ]; then
     curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy+CRITICAL" >/dev/null 2>&1 || true
   fi
+
+  # ── Phase 3C: Expanded notifications ─────────────────────────────
+  # 1. Notify when a task fails after spending >$15
+  local tasks_json
+  tasks_json=$(read_tasks)
+  echo "$tasks_json" | jq -c '.[] | select(.status == "failed" or .status == "killed")' 2>/dev/null | while IFS= read -r ftask; do
+    local fid fcost fnotified
+    fid=$(echo "$ftask" | jq -r '.id')
+    fnotified=$(echo "$ftask" | jq -r '.cost_notified // false')
+    [ "$fnotified" = "true" ] && continue
+    # Get cost from log
+    fcost=$(python3 -c "
+import json, sys
+from pathlib import Path
+log = '$(echo "$ftask" | jq -r '.log // ""')'
+model = '$(echo "$ftask" | jq -r '.model // "sonnet"')'
+cost_map = {'claude-sonnet-4-6':{'i':3.0,'o':15.0},'claude-opus-4-6':{'i':15.0,'o':75.0},'claude-haiku-4-5':{'i':0.8,'o':4.0},'o3':{'i':10.0,'o':40.0},'gpt-5.1-codex-max':{'i':15.0,'o':60.0},'gpt-5.1-codex-mini':{'i':2.5,'o':10.0},'gpt-5.4':{'i':20.0,'o':80.0}}
+model_map = {'sonnet':'claude-sonnet-4-6','opus':'claude-opus-4-6','haiku':'claude-haiku-4-5','codex':'o3','codex-max':'gpt-5.1-codex-max','codex-mini':'gpt-5.1-codex-mini','gpt54':'gpt-5.4'}
+mid = model_map.get(model, 'claude-sonnet-4-6')
+rates = cost_map.get(mid, {'i':3.0,'o':15.0})
+inp = out = 0
+if log and Path(log).exists():
+    for line in open(log):
+        try:
+            r = json.loads(line.strip())
+            if r.get('type')=='assistant':
+                u = r.get('message',{}).get('usage',{})
+                inp += u.get('input_tokens',0)
+                out += u.get('output_tokens',0)
+        except: pass
+print(f'{(inp*rates[\"i\"]+out*rates[\"o\"])/1e6:.2f}')
+" 2>/dev/null)
+    if [ -n "$fcost" ] && python3 -c "import sys; sys.exit(0 if float('$fcost') > 15 else 1)" 2>/dev/null; then
+      local fstatus
+      fstatus=$(echo "$ftask" | jq -r '.status')
+      feed_write "alert" "Task $fid $fstatus after \$$fcost spend" "$fid"
+      curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy:+Expensive+Failure&message=$fid+$fstatus+after+\$$fcost" >/dev/null 2>&1 || true
+      # Mark as notified to avoid repeat
+      (
+        flock -x 200
+        read_tasks | jq --arg tid "$fid" 'map(if .id == $tid then .cost_notified = true else . end)' | write_tasks
+      ) 200>"$TASKS_LOCK"
+    fi
+  done
+
+  # 2. Notify when a PR is ready for review (first time only)
+  echo "$tasks_json" | jq -c '.[] | select(.status == "pr_open" or .status == "reviewing")' 2>/dev/null | while IFS= read -r prtask; do
+    local prid prnotified prnum
+    prid=$(echo "$prtask" | jq -r '.id')
+    prnotified=$(echo "$prtask" | jq -r '.pr_notified // false')
+    prnum=$(echo "$prtask" | jq -r '.pr // ""')
+    [ "$prnotified" = "true" ] && continue
+    [ -z "$prnum" ] && continue
+    feed_write "alert" "PR #$prnum ready for review ($prid)" "$prid"
+    curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy:+PR+Ready&message=PR+%23$prnum+($prid)+ready+for+review" >/dev/null 2>&1 || true
+    (
+      flock -x 200
+      read_tasks | jq --arg tid "$prid" 'map(if .id == $tid then .pr_notified = true else . end)' | write_tasks
+    ) 200>"$TASKS_LOCK"
+  done
+
+  # 3. Notify when auth failures are detected in interventions
+  echo "$json_response" | jq -c '.interventions // [] | .[] | select(.message | test("auth|sign.in|login|403|401|credential"; "i"))' 2>/dev/null | while IFS= read -r auth_iv; do
+    local auth_tid auth_msg
+    auth_tid=$(echo "$auth_iv" | jq -r '.task_id')
+    auth_msg=$(echo "$auth_iv" | jq -r '.message' | head -c 80)
+    curl -s "$NOTIFY_URL?session=lucy-orch&title=Lucy:+Auth+Issue&message=$auth_tid:+$(echo "$auth_msg" | jq -sRr @uri)" >/dev/null 2>&1 || true
+  done
 
   # ── Process chat responses ────────────────────────────────────────
   if [ -n "$inbox_messages" ]; then

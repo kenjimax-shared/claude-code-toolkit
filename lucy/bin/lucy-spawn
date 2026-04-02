@@ -23,7 +23,7 @@ Options:
   --max-retries <n>   Max retries on failure (default: 3)
 
 Example:
-  lucy-spawn --repo MyProject --type bugfix --model sonnet \
+  lucy-spawn --repo ExampleCo --type bugfix --model sonnet \
     --desc "Fix typo in README" --issue 123
 USAGE
   exit 1
@@ -60,6 +60,11 @@ if ! $GROUP_EXPLICIT; then
 fi
 
 [[ -z "$DESC" ]] && echo "Error: --desc is required" && usage
+
+# Validate group name (prevents path traversal in context/assessment paths)
+if [ -n "$GROUP" ]; then
+  validate_identifier "$GROUP" "group" || exit 1
+fi
 
 # Auto-select model if not explicitly provided
 if ! $MODEL_EXPLICIT; then
@@ -112,10 +117,16 @@ if [ -z "$SLUG" ]; then
   SLUG=$(echo "$DESC" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 ]//g' | tr ' ' '-' | cut -c1-40 | sed 's/-$//')
 fi
 
+# Validate slug (security: prevents shell injection, path traversal, XSS)
+validate_identifier "$SLUG" "slug" || exit 1
+
 REPO_LOWER="${REPO,,}"
 TASK_ID="${REPO_LOWER:+${REPO_LOWER}-}${ISSUE:+${ISSUE}-}${SLUG}"
 # Remove leading dash if no repo
 TASK_ID="${TASK_ID#-}"
+
+# Validate the final task ID
+validate_identifier "$TASK_ID" "task ID" || exit 1
 
 if $IS_OPS; then
   BRANCH=""
@@ -134,7 +145,7 @@ TMUX_SESSION="${TMUX_PREFIX}-w-${TASK_ID}"
 AGENT_LOG="$LUCY_DIR/logs/${TASK_ID}.log"
 
 # Check if task already exists
-if jq -e ".[] | select(.id == \"$TASK_ID\")" "$TASKS_FILE" >/dev/null 2>&1; then
+if jq -e --arg tid "$TASK_ID" '.[] | select(.id == $tid)' "$TASKS_FILE" >/dev/null 2>&1; then
   echo "Error: Task '$TASK_ID' already exists. Use lucy-kill first to remove it."
   exit 1
 fi
@@ -244,6 +255,12 @@ PROMPT_FILE="$META_DIR/.lucy-prompt.md"
     echo "## Business Context"
     echo ""
     for CTX in "${CONTEXT_FILES[@]}"; do
+      # Validate context filename (no path traversal)
+      if [[ "$CTX" == *"/"* ]] || [[ "$CTX" == *".."* ]]; then
+        echo "(Error: context filename '$CTX' contains path separators, skipping)"
+        echo ""
+        continue
+      fi
       CTX_FILE="$LUCY_DIR/context/$CTX"
       if [ -f "$CTX_FILE" ]; then
         cat "$CTX_FILE"
@@ -264,6 +281,36 @@ PROMPT_FILE="$META_DIR/.lucy-prompt.md"
     echo ""
     echo "Do NOT write .lucy-* files in the working directory. The task directory is separate so the repo stays clean."
     echo ""
+  fi
+
+  # Phase 3B: Inject known pitfalls relevant to this group
+  PITFALLS_FILE="$LUCY_DIR/context/known-pitfalls.md"
+  if [ -f "$PITFALLS_FILE" ] && [ -s "$PITFALLS_FILE" ]; then
+    # Extract pitfalls relevant to this group (or general ones)
+    relevant_pitfalls=$(python3 -c "
+import sys
+group = '$GROUP'
+lines = open('$PITFALLS_FILE').readlines()
+in_relevant = False
+output = []
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith('## '):
+        section_group = stripped[3:].strip().lower()
+        in_relevant = (section_group == group.lower() or section_group == 'general')
+    elif in_relevant and stripped:
+        output.append(line.rstrip())
+if output:
+    print('\n'.join(output[:15]))
+" 2>/dev/null)
+    if [ -n "$relevant_pitfalls" ]; then
+      echo "## Known Pitfalls (learn from past failures)"
+      echo ""
+      echo "These are patterns that caused failures in previous tasks. Avoid repeating them:"
+      echo ""
+      echo "$relevant_pitfalls"
+      echo ""
+    fi
   fi
 
   # Include AGENTS.md
@@ -308,32 +355,33 @@ tmux send-keys -t "$TMUX_SESSION" "$AGENT_CMD" Enter
 NOW=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 # Record which tmux session spawned this task (for cascade cleanup on terminal close)
 PARENT_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
-read_tasks | jq ". + [{
-  \"id\": \"$TASK_ID\",
-  \"repo\": \"$REPO\",
-  \"group\": \"$GROUP\",
-  \"description\": $(echo "$DESC" | jq -Rs .),
-  \"type\": \"$TYPE\",
-  \"model\": \"$MODEL\",
-  \"tmux\": \"$TMUX_SESSION\",
-  \"worktree\": \"${WORKTREE_DIR:-${OPS_TASK_DIR:-$WORK_DIR}}\",
-  \"branch\": \"${BRANCH:-}\",
-  \"status\": \"running\",
-  \"spawned_at\": \"$NOW\",
-  \"retries\": 0,
-  \"max_retries\": $MAX_R,
-  \"pr\": null,
-  \"log\": \"$AGENT_LOG\",
-  \"chrome_port\": ${CHROME_PORT:-null},
-  \"parent_session\": \"$PARENT_SESSION\",
-  \"checks\": {
-    \"ci\": null,
-    \"review_codex\": null,
-    \"review_gemini\": null,
-    \"review_claude\": null
-  },
-  \"notified\": false
-}]" | write_tasks
+# Register task under flock (prevents race with monitor/kill/other spawns)
+(
+  flock -x 200
+  read_tasks | jq --arg tid "$TASK_ID" \
+    --arg repo "$REPO" \
+    --arg group "$GROUP" \
+    --arg desc "$(echo "$DESC")" \
+    --arg type "$TYPE" \
+    --arg model "$MODEL" \
+    --arg tmux "$TMUX_SESSION" \
+    --arg worktree "${WORKTREE_DIR:-${OPS_TASK_DIR:-$WORK_DIR}}" \
+    --arg branch "${BRANCH:-}" \
+    --arg now "$NOW" \
+    --argjson max_r "$MAX_R" \
+    --arg log "$AGENT_LOG" \
+    --argjson chrome_port "${CHROME_PORT:-null}" \
+    --arg parent "$PARENT_SESSION" \
+    '. + [{
+      id: $tid, repo: $repo, group: $group, description: $desc,
+      type: $type, model: $model, tmux: $tmux, worktree: $worktree,
+      branch: $branch, status: "running", spawned_at: $now,
+      retries: 0, max_retries: $max_r, pr: null, log: $log,
+      chrome_port: $chrome_port, parent_session: $parent,
+      checks: {ci: null, review_codex: null, review_gemini: null, review_claude: null},
+      notified: false
+    }]' | write_tasks
+) 200>"$TASKS_LOCK"
 
 # Step 9: Notify
 # No push notification for spawn (orchestrator handles awareness)

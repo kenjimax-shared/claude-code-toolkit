@@ -3,8 +3,8 @@
 # Adapted from everything-claude-code (ECC).
 # Configurable via env: ECC_COMPACT_THRESHOLD (default 50), ECC_COMPACT_REPEAT (default 25).
 
-THRESHOLD=${ECC_COMPACT_THRESHOLD:-50}
-REPEAT=${ECC_COMPACT_REPEAT:-25}
+THRESHOLD=${ECC_COMPACT_THRESHOLD:-80}
+REPEAT=${ECC_COMPACT_REPEAT:-40}
 
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)

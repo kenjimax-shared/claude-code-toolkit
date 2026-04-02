@@ -105,3 +105,5 @@ done < <(ps -eo pid,args 2>/dev/null | grep '[c]hrome.*--user-data-dir=/tmp' | g
 if [ "$reaped" -gt 0 ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaped $reaped stale Chrome instance(s)"
 fi
+
+# Orphan daemon reaping is handled separately by agent-browser-reap-orphans (cron, every 30 min).

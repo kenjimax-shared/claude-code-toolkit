@@ -22,7 +22,7 @@ PS_EXE="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 if [ -n "$TMUX_SESSION" ]; then
   CTX_PCT=""
   if [ -n "$SESSION_ID" ]; then
-    for dir in "$HOME/.claude/projects/-home-YOUR_USER-PROJECT" "$HOME/.claude/projects/-mnt-c-Users-YOUR_USER-PROJECT"; do
+    for dir in "$HOME/.claude/projects/-home-user-Claude" "$HOME/.claude/projects/-mnt-c-Users-user-Claude"; do
       if [ -f "$dir/${SESSION_ID}.jsonl" ]; then
         CTX_PCT=$(tail -50 "$dir/${SESSION_ID}.jsonl" | python3 -c "
 import sys, json
@@ -64,7 +64,7 @@ fi
 # Step 1: Check if user is at the desktop (Windows idle < 5 min)
 IDLE_SCRIPT="$(wslpath -w "$HOME/.claude/scripts/win-idle.ps1" 2>/dev/null)"
 PLAY_SCRIPT="$(wslpath -w "$HOME/.claude/scripts/win-play.ps1" 2>/dev/null)"
-WIN_SOUND="C:\\Users\\YOUR_USER\\.claude\\notify-sound.mp3"
+WIN_SOUND="C:\\Users\\user\\.claude\\notify-sound.mp3"
 
 WIN_IDLE=$("$PS_EXE" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$IDLE_SCRIPT" 2>/dev/null | tr -d '\r\n')
 WIN_IDLE=${WIN_IDLE:-99999}

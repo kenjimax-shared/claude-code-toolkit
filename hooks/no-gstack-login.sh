@@ -1,42 +1,28 @@
 #!/usr/bin/env bash
-# PreToolUse hook (matcher: Bash): Block gstack browse from navigating to login-required sites.
+# Hook: Block gstack browse from being used on login-required sites.
 # These sites MUST use agent-browser with persistent profiles instead.
 #
-# gstack browse (Playwright) shares a single browser instance across all terminals.
-# It has no persistent auth, so login-required sites will either fail or create
-# session conflicts. agent-browser provides isolated Chrome instances with persistent
-# profiles for each service.
+# Reads the tool input from $CLAUDE_TOOL_INPUT (JSON with "command" key for Bash tool).
 
-INPUT=$(cat)
-TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
-
-# Only applies to Bash tool
-[ "$TOOL" = "Bash" ] || exit 0
-
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
-[ -z "$CMD" ] && exit 0
+COMMAND="${CLAUDE_TOOL_INPUT:-}"
 
 # Only check commands that use gstack browse
-echo "$CMD" | grep -q "gstack.*browse\|browse/dist/browse" || exit 0
+if ! echo "$COMMAND" | grep -q "gstack.*browse\|browse/dist/browse"; then
+  exit 0
+fi
 
-# Only check navigation commands (goto, open, navigate)
-echo "$CMD" | grep -qiE "(goto|open|navigate)\b" || exit 0
+# Only check navigation commands (goto, open)
+if ! echo "$COMMAND" | grep -qiE "(goto|open|navigate)\b"; then
+  exit 0
+fi
 
-# Domains that require login and MUST use agent-browser
-LOGIN_DOMAINS="
-  app.hubspot.com
-  tagmanager.google.com
-  zapier.com
-  app.nextdoor.com
-  qbo.intuit.com
-  ads.google.com
-  analytics.google.com
-"
+# List of domains that require login and MUST use agent-browser
+LOGIN_DOMAINS="app.hubspot.com tagmanager.google.com zapier.com app.nextdoor.com qbo.intuit.com ads.google.com analytics.google.com"
 
 for domain in $LOGIN_DOMAINS; do
-  if echo "$CMD" | grep -qi "$domain"; then
-    echo "{\"decision\":\"block\",\"reason\":\"Do not use gstack browse for $domain. It requires login and gstack browse has no persistent auth. Use agent-browser with the appropriate profile instead.\"}"
-    exit 0
+  if echo "$COMMAND" | grep -qi "$domain"; then
+    echo "BLOCKED: Do not use gstack browse for $domain. Use agent-browser with the appropriate profile instead." >&2
+    exit 2
   fi
 done
 

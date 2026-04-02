@@ -37,7 +37,7 @@ Rules for acceptance criteria:
 - Each criterion must be independently verifiable by someone who did not do the work
 - Be concrete: name the exact files, events, endpoints, systems, or values involved
 - Bad: "Tracking works correctly"
-- Good: "GA4 Realtime report shows a 'generate_lead' event with parameter 'region=WEST' when the quote form on quote.example.com is submitted"
+- Good: "GA4 Realtime report shows a 'generate_lead' event with parameter 'region=CA1' when the quote form on quote.exampleco.com is submitted"
 - Bad: "Tests pass"
 - Good: "Running `npm test` exits with code 0 and all tests in `src/__tests__/pricing.test.ts` pass"
 

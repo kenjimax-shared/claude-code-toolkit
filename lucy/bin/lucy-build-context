@@ -29,7 +29,7 @@ Configuration:
   - refresh_interval_hours: how often to rebuild (default: 24)
 
 Example:
-  lucy-build-context --group myproject
+  lucy-build-context --group exampleco
 USAGE
   exit 1
 }
@@ -47,6 +47,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$GROUP" ]] && echo "Error: --group is required" && usage
+
+# Validate group name (prevents path traversal)
+validate_identifier "$GROUP" "group" || exit 1
 
 # Check for sources config
 SOURCES_FILE="$CONTEXT_DIR/${GROUP}-sources.json"

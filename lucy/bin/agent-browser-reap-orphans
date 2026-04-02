@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# agent-browser-reap-orphans: kill orphaned agent-browser daemons.
+# Runs via cron every 30 minutes. Two modes:
+#   1. Daemons with a TMUX_PANE that no longer exists: killed immediately.
+#   2. Daemons with no TMUX_PANE (launched outside tmux): killed after 12 hours.
+
+set -euo pipefail
+
+LOG_PREFIX="[ab-reap-orphans]"
+
+# Get all live tmux pane IDs once (avoid calling tmux per-daemon)
+live_panes=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null || echo "")
+
+orphan_reaped=0
+while IFS= read -r daemon_pid; do
+  [ -z "$daemon_pid" ] && continue
+
+  # Read TMUX_PANE from the daemon's environment
+  tmux_pane=$(cat /proc/"$daemon_pid"/environ 2>/dev/null | tr '\0' '\n' | grep '^TMUX_PANE=' | cut -d= -f2 || true)
+
+  # No TMUX_PANE = launched outside tmux; only reap if older than 12 hours
+  if [ -z "$tmux_pane" ]; then
+    daemon_age_sec=$(( $(date +%s) - $(stat -c %Y /proc/"$daemon_pid" 2>/dev/null || echo "$(date +%s)") ))
+    if [ "$daemon_age_sec" -gt 43200 ]; then
+      profile=$(cat /proc/"$daemon_pid"/environ 2>/dev/null | tr '\0' '\n' | grep '^AGENT_BROWSER_PROFILE=' | cut -d= -f2 || echo "unknown")
+      echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaping no-pane daemon PID $daemon_pid (age: $((daemon_age_sec/3600))h, profile: $profile)"
+      kill "$daemon_pid" 2>/dev/null || true
+      orphan_reaped=$((orphan_reaped + 1))
+    fi
+    continue
+  fi
+
+  # Check if the pane still exists
+  if ! echo "$live_panes" | grep -qx "$tmux_pane"; then
+    profile=$(cat /proc/"$daemon_pid"/environ 2>/dev/null | tr '\0' '\n' | grep '^AGENT_BROWSER_PROFILE=' | cut -d= -f2 || echo "unknown")
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaping orphan daemon PID $daemon_pid (pane $tmux_pane gone, profile: $profile)"
+    kill "$daemon_pid" 2>/dev/null || true
+    orphan_reaped=$((orphan_reaped + 1))
+  fi
+done < <(pgrep -f 'agent-browser-linux-x64' 2>/dev/null || true)
+
+if [ "$orphan_reaped" -gt 0 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX reaped $orphan_reaped orphan daemon(s)"
+fi

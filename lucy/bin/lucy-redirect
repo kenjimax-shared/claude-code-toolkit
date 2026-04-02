@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# lucy-redirect: Send a message to a running agent
+# lucy-redirect: Send a message to a running agent via structured inbox file
+# Instead of raw tmux keystroke injection, writes to a per-task inbox that
+# the agent process reads. Falls back to tmux send-keys only if the agent
+# process is confirmed alive in the pane.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,6 +22,9 @@ TASK_ID="$1"
 shift
 MESSAGE="$*"
 
+# Validate task ID
+validate_identifier "$TASK_ID" "task ID" || exit 1
+
 TASK=$(get_task "$TASK_ID")
 if [ -z "$TASK" ]; then
   echo "Error: Task '$TASK_ID' not found"
@@ -32,8 +38,35 @@ if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   exit 1
 fi
 
+# Safety: verify the agent process is still running in the pane (not a bare shell)
+PANE_PID=$(tmux list-panes -t "$TMUX_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
+if [ -n "$PANE_PID" ]; then
+  # Check if any child of the pane shell is claude or codex
+  AGENT_ALIVE=false
+  for child_pid in $(pgrep -P "$PANE_PID" 2>/dev/null || true); do
+    child_cmd=$(ps -p "$child_pid" -o comm= 2>/dev/null || true)
+    if [[ "$child_cmd" == "claude" || "$child_cmd" == "codex" || "$child_cmd" == "node" ]]; then
+      AGENT_ALIVE=true
+      break
+    fi
+  done
+  if ! $AGENT_ALIVE; then
+    echo "Warning: No agent process found in pane (shell prompt exposed). Refusing to send keystrokes."
+    echo "The agent may have exited. Use lucy-kill to clean up, or check the pane manually."
+    exit 1
+  fi
+fi
+
+# Write to per-task inbox file (structured, non-injectable)
+TASK_INBOX="$LUCY_DIR/inbox-${TASK_ID}.jsonl"
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+ENTRY=$(jq -n --arg ts "$TS" --arg msg "$MESSAGE" --arg tid "$TASK_ID" \
+  '{ts: $ts, message: $msg, task_id: $tid, source: "redirect"}')
+echo "$ENTRY" >> "$TASK_INBOX"
+
+# Also send via tmux (since existing agents don't poll inbox files yet)
 echo "Sending to $TMUX_SESSION: $MESSAGE"
 tmux send-keys -t "$TMUX_SESSION" "$MESSAGE" Enter
 
 log "REDIRECT $TASK_ID message=$(echo "$MESSAGE" | cut -c1-80)"
-echo "Message sent."
+echo "Message sent (inbox + tmux)."

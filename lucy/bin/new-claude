@@ -7,6 +7,5 @@ fi
 # Clean up lock after 3s in background (survives exec)
 (sleep 3; rmdir "$LOCKDIR" 2>/dev/null) &
 
-# Update the path below to your project working directory
 cd ~/Claude
 exec tmux new-session 'claude --dangerously-skip-permissions'
