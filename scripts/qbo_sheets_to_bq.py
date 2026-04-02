@@ -18,7 +18,7 @@ from googleapiclient.discovery import build
 from google.cloud import bigquery
 
 SPREADSHEET_ID = "1AFGtNcqZj5VA5Lm8HFZxmB-V7EyIKzEYtZ2AfIeuRjc"
-CREDS_FILE = "/home/kenji/.google_workspace_mcp/credentials/user@client.example.com.json"
+CREDS_FILE = "/home/user/.google_workspace_mcp/credentials/user@client.example.com.json"
 BQ_PROJECT = "example-project"
 BQ_DATASET = "staging_ext"
 
@@ -40,7 +40,7 @@ def get_sheets_credentials():
         token_data = json.load(f)
 
     # Get OAuth client info from the workspace MCP credentials.json
-    creds_json_path = "/home/kenji/.google_workspace_mcp/credentials.json"
+    creds_json_path = "/home/user/.google_workspace_mcp/credentials.json"
     with open(creds_json_path) as f:
         client_config = json.load(f)
 

@@ -11,7 +11,7 @@ AUTH_SCRIPT="$SCRIPT_DIR/oauth_auth.py"
 CHECK_SCRIPT="$SCRIPT_DIR/check_workspace_tokens.sh"
 
 DEFAULT_EMAILS=(
-    "kenji@agency.example.com"
+    "user@agency.example.com"
     "user@client.example.com"
     "analytics@agency.example.com"
     "personal@example.com"

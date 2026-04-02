@@ -65,7 +65,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/tagmanager.publish",
 ]
 
-email = sys.argv[1] if len(sys.argv) > 1 else "kenji@agency.example.com"
+email = sys.argv[1] if len(sys.argv) > 1 else "user@agency.example.com"
 
 code_verifier = secrets.token_urlsafe(64)
 code_challenge = base64.urlsafe_b64encode(

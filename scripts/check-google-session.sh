@@ -5,7 +5,7 @@
 
 PROFILE="$HOME/.agent-browser/profiles/google-ads-premier"
 COOKIES_DB="$PROFILE/Default/Cookies"
-ALERT_EMAIL="kenji@agency.example.com"
+ALERT_EMAIL="user@agency.example.com"
 LOG_FILE="$HOME/.claude/logs/google-session-check.log"
 WORKSPACE_CREDS="$HOME/.google_workspace_mcp/credentials"
 
@@ -114,16 +114,16 @@ send_alert() {
   log "ALERT: $message"
 
   # Use the workspace MCP oauth token to send via Gmail API
-  # Find the access token for kenji@agency.example.com
-  TOKEN_FILE="$WORKSPACE_CREDS/kenji@agency.example.com.json"
+  # Find the access token for user@agency.example.com
+  TOKEN_FILE="$WORKSPACE_CREDS/user@agency.example.com.json"
   if [ ! -f "$TOKEN_FILE" ]; then
-    TOKEN_FILE=$(find "$WORKSPACE_CREDS" -name "*kenji*agencyco*" -type f 2>/dev/null | head -1)
+    TOKEN_FILE=$(find "$WORKSPACE_CREDS" -name "*user*agencyco*" -type f 2>/dev/null | head -1)
   fi
 
   if [ -z "$TOKEN_FILE" ] || [ ! -f "$TOKEN_FILE" ]; then
     log "ERROR: Cannot find workspace token for email alert. Token dir: $WORKSPACE_CREDS"
     log "Falling back to gh issue comment"
-    gh issue comment 1 --repo kenjimax/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
+    gh issue comment 1 --repo user-org/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
     return
   fi
 
@@ -156,7 +156,7 @@ except Exception as e:
 
   if [ -z "$ACCESS_TOKEN" ]; then
     log "ERROR: Could not get access token for Gmail"
-    gh issue comment 1 --repo kenjimax/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
+    gh issue comment 1 --repo user-org/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
     return
   fi
 
@@ -168,7 +168,7 @@ except Exception as e:
   RAW_EMAIL=$(printf "To: %s\nSubject: %s\nContent-Type: text/plain; charset=utf-8\n\n%b" "$ALERT_EMAIL" "$SUBJECT" "$BODY" | python3 -c "import sys,base64; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode())")
 
   curl -s -X POST \
-    "https://gmail.googleapis.com/gmail/v1/users/kenji%40agency.example.com/messages/send" \
+    "https://gmail.googleapis.com/gmail/v1/users/user%40agency.example.com/messages/send" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"raw\": \"$RAW_EMAIL\"}" > /dev/null 2>&1
@@ -177,7 +177,7 @@ except Exception as e:
     log "Alert email sent to $ALERT_EMAIL"
   else
     log "ERROR: Failed to send email, falling back to gh issue"
-    gh issue comment 1 --repo kenjimax/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
+    gh issue comment 1 --repo user-org/agencyco-tasks --body "**Google Session Alert**: $message" 2>/dev/null
   fi
 }
 
