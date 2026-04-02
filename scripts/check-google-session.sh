@@ -3,7 +3,7 @@
 # Checks cookie expiration and refreshes session by visiting a Google page
 # Sends email alert via Gmail API if session is dead
 
-PROFILE="$HOME/.agent-browser/profiles/google-ads-premier"
+PROFILE="$HOME/.agent-browser/profiles/google-ads-clientco"
 COOKIES_DB="$PROFILE/Default/Cookies"
 ALERT_EMAIL="user@agency.example.com"
 LOG_FILE="$HOME/.claude/logs/google-session-check.log"
@@ -162,7 +162,7 @@ except Exception as e:
 
   # Send email via Gmail API
   SUBJECT="[Alert] Google Ads Session: marketing@shapedigital.io"
-  BODY="Session check failed for marketing@shapedigital.io (ClientCo Group Google Ads/GA4/GTM).\n\nIssue: $message\n\nAction: Log in manually and complete 2FA to restore the session.\nProfile: ~/.agent-browser/profiles/google-ads-premier/"
+  BODY="Session check failed for marketing@shapedigital.io (ClientCo Group Google Ads/GA4/GTM).\n\nIssue: $message\n\nAction: Log in manually and complete 2FA to restore the session.\nProfile: ~/.agent-browser/profiles/google-ads-clientco/"
 
   # Build raw email
   RAW_EMAIL=$(printf "To: %s\nSubject: %s\nContent-Type: text/plain; charset=utf-8\n\n%b" "$ALERT_EMAIL" "$SUBJECT" "$BODY" | python3 -c "import sys,base64; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode())")
