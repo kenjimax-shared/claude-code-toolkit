@@ -62,7 +62,7 @@ run_gate() {
   local cmd="$2"
   echo -n "  $name... "
   local output
-  if output=$(cd "$WORKTREE" && eval "$cmd" 2>&1); then
+  if output=$(cd "$WORKTREE" && bash -c "$cmd" 2>&1); then
     echo "PASS"
     return 0
   else
