@@ -14,10 +14,27 @@
 REAL="$HOME/.npm-global/bin/agent-browser"
 PROFILES="$HOME/.agent-browser/profiles"
 OWNERS="$HOME/.agent-browser/terminal-owners"
+SESSIONS="$HOME/.agent-browser/sessions"
 TAG="[ab-safe]"
 
 [[ -x "$REAL" ]] || { echo "$TAG binary not found: $REAL" >&2; exit 1; }
 mkdir -p "$OWNERS"
+
+# --- Workaround: --session-name auto-load is broken in agent-browser >=0.23 ---
+# After opening a session, explicitly load state from the saved state file.
+# This restores cookies/localStorage that --session-name should have loaded on startup.
+load_session_state() {
+    local ab_session="$1"
+    local sname="$2"
+    local state_enc="${SESSIONS}/${ab_session}-${sname}.json.enc"
+    local state_json="${SESSIONS}/${ab_session}-${sname}.json"
+
+    if [[ -f "$state_enc" ]]; then
+        "$REAL" --session "$ab_session" state load "$state_enc" >/dev/null 2>&1 &
+    elif [[ -f "$state_json" ]]; then
+        "$REAL" --session "$ab_session" state load "$state_json" >/dev/null 2>&1 &
+    fi
+}
 
 # --- Terminal identity ---
 get_terminal_id() {
@@ -178,11 +195,14 @@ if $is_open && [[ -n "$session" ]]; then
         set_derivative "$session" "$derivative"
         track_ownership "$derivative"
 
-        # Build the derivative command
-        exec "$REAL" --session "$derivative" \
+        # Build the derivative command (no exec: we need to load state after)
+        "$REAL" --session "$derivative" \
             --profile "$deriv_profile" \
             --session-name "$session" \
             open ${url_arg:+"$url_arg"}
+        ret=$?
+        load_session_state "$derivative" "$session"
+        exit $ret
     fi
 
     # Session is NOT running; this terminal gets to be the primary owner
@@ -220,7 +240,10 @@ if $is_open && [[ -n "$session" ]]; then
 
     track_ownership "$session"
 
-    # Inject extras before the subcommand and exec
+    # Determine effective session-name for state loading
+    effective_sname="${sname:-$session}"
+
+    # Inject extras before the subcommand
     if [[ ${#extras[@]} -gt 0 ]]; then
         echo "$TAG injected: ${extras[*]}" >&2
         final=()
@@ -230,10 +253,16 @@ if $is_open && [[ -n "$session" ]]; then
             fi
             final+=("$arg")
         done
-        exec "$REAL" "${final[@]}"
+        "$REAL" "${final[@]}"
+        ret=$?
+        load_session_state "$session" "$effective_sname"
+        exit $ret
     fi
 
-    exec "$REAL" "$@"
+    "$REAL" "$@"
+    ret=$?
+    load_session_state "$session" "$effective_sname"
+    exit $ret
 fi
 
 # Handle explicit close: clean up derivative mapping + untrack ownership
