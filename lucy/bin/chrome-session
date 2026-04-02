@@ -9,8 +9,9 @@
 #   chrome-session port <session-id>                 Print port for a session
 #   chrome-session merge <session-id>                Merge session data back to base
 #
-# After 'start', sets CHROME_DEBUG_PORT in the caller's env (use eval):
-#   eval "$(chrome-session start my-session)"
+# After 'start', extract the port from stdout:
+#   CHROME_DEBUG_PORT=$(chrome-session start my-session | grep -oP 'CHROME_DEBUG_PORT=\K\d+')
+#   export CHROME_DEBUG_PORT
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -368,8 +369,9 @@ Commands:
   port <id>                Print the debug port for a session
   merge <id>               Merge session extensions/data back to base template
 
-After 'start', eval the output to set CHROME_DEBUG_PORT:
-  eval "$(chrome-session start my-session)"
+After 'start', extract the port from stdout:
+  CHROME_DEBUG_PORT=$(chrome-session start my-session | grep -oP 'CHROME_DEBUG_PORT=\K\d+')
+  export CHROME_DEBUG_PORT
 HELP
     ;;
 esac

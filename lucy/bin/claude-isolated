@@ -33,8 +33,9 @@ SESSION_ID=$(echo "$SESSION_ID" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/--*/-/g; s/^-
 
 echo "Starting isolated Chrome session: $SESSION_ID"
 
-# Start Chrome session (eval sets CHROME_DEBUG_PORT)
-eval "$("$SCRIPT_DIR/chrome-session" start "$SESSION_ID" $VISIBLE)"
+# Start Chrome session and extract the port (no eval)
+CHROME_DEBUG_PORT=$("$SCRIPT_DIR/chrome-session" start "$SESSION_ID" $VISIBLE | grep -oP 'CHROME_DEBUG_PORT=\K\d+')
+export CHROME_DEBUG_PORT
 
 echo "Chrome ready on port $CHROME_DEBUG_PORT"
 
