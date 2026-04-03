@@ -2,6 +2,7 @@
 # Hook: Name tmux session based on first substantive prompt.
 # Fires on UserPromptSubmit. Runs once per session (skips trivial prompts).
 # Uses Haiku via Anthropic API for smart slugs, falls back to heuristic.
+# Also writes custom-title to JSONL so Claude Code's /resume picker matches tmux.
 
 LOG="$HOME/.claude/hooks/name-session.log"
 log() { echo "$(date +%H:%M:%S) $*" >> "$LOG"; }
@@ -77,6 +78,28 @@ save_ownership() {
   echo "$SLUG" > "$SLUG_DIR/$SESSION_ID"
 }
 
+# Find the JSONL transcript for this session
+find_transcript() {
+  for dir in "$HOME/.claude/projects/-home-user-Claude" "$HOME/.claude/projects/-mnt-c-Users-user-Claude"; do
+    if [ -f "$dir/${SESSION_ID}.jsonl" ]; then
+      echo "$dir/${SESSION_ID}.jsonl"
+      return
+    fi
+  done
+}
+
+# Write custom-title to the JSONL so Claude Code's /resume picker shows the slug.
+# Uses the same format as /rename, which has the highest user-settable priority
+# in Claude Code's display title logic (customTitle > summary > firstPrompt).
+sync_claude_title() {
+  local slug="$1"
+  [ -z "$slug" ] && return
+  local transcript
+  transcript=$(find_transcript)
+  [ -z "$transcript" ] && return
+  printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$slug" "$SESSION_ID" >> "$transcript"
+}
+
 # --- Check if trivial prompt ---
 
 IS_TRIVIAL=$(HOOK_PROMPT="$PROMPT" python3 << 'PYEOF'
@@ -107,6 +130,7 @@ if [ "$IS_TRIVIAL" = "TRIVIAL" ]; then
                 log "RESTORE slug '$SLUG' on trivial prompt (tmux was '$CURRENT_NAME')"
                 rename_tmux_session
                 save_ownership
+                sync_claude_title "$SLUG"
                 exit 0
             fi
         fi
@@ -154,6 +178,12 @@ else
     # No owner file exists. This name was set before the tracking system.
     # Claim it for this session so future resumes will re-name.
     echo "$SESSION_ID" > "$OWNER_FILE"
+    # Also save slug file so we have it for future syncs
+    SLUG_DIR="$HOME/.claude/session-slugs"
+    mkdir -p "$SLUG_DIR"
+    echo "$CURRENT_NAME" > "$SLUG_DIR/$SESSION_ID"
+    # Write custom-title once on first claim
+    sync_claude_title "$CURRENT_NAME"
     log "SKIP already named '$CURRENT_NAME' (claimed by $SESSION_ID)"
     exit 0
   fi
@@ -322,4 +352,5 @@ log "SLUG=$SLUG (was '$CURRENT_NAME')"
 
 rename_tmux_session
 save_ownership
+sync_claude_title "$SLUG"
 exit 0

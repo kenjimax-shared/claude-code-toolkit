@@ -43,8 +43,12 @@ if not display:
     if len(first_prompt) > 200:
         display += "\u2026"
 
-entry = json.dumps({"type": "last-prompt", "lastPrompt": display, "sessionId": session_id})
+entries = [
+    json.dumps({"type": "last-prompt", "lastPrompt": display, "sessionId": session_id}),
+    json.dumps({"type": "custom-title", "customTitle": display, "sessionId": session_id}),
+]
 
 with open(transcript, "a") as f:
-    f.write(entry + "\n")
+    for entry in entries:
+        f.write(entry + "\n")
 PYEOF
