@@ -153,7 +153,53 @@ declare -A REPO_GROUP_MAP=(
 
 ---
 
-## 5. agent-browser Profiles
+## 5. Remote Access (`remote/`)
+
+See `remote/README.md` for the full setup guide. Key placeholders:
+
+### code-server (`remote/code-server/config.yaml`)
+| Placeholder | Description |
+|---|---|
+| `CHANGE_ME` | code-server login password; set a strong one |
+
+### tmux-mobile (`remote/tmux-mobile/server.js`)
+| Variable | Default | Description |
+|---|---|---|
+| `CLAUDE_WORK_DIR` | `~/Claude` | Working directory for new Claude sessions created from phone |
+| `PORT` | `3200` | tmux-mobile listen port |
+
+### Notification Server (`remote/notifications/notify-server.js`, `remote/notifications/claude-notify.service`)
+| Placeholder | Description |
+|---|---|
+| `YOUR_NTFY_TOPIC_HERE` | ntfy.sh topic for push notifications (env var `NTFY_TOPIC`) |
+| `~/.claude/notify-sound.mp3` | Place any MP3 file here for notification audio |
+
+### code-server Extension (`remote/code-server-extension/`)
+No configuration needed. Install to `~/.local/share/code-server/extensions/local.claude-snooze-1.0.0/`.
+
+### File Placement (Remote)
+| Repo Path | Install To |
+|---|---|
+| `remote/code-server/config.yaml` | `~/.config/code-server/config.yaml` |
+| `remote/code-server/keybindings.json` | `~/.local/share/code-server/User/keybindings.json` |
+| `remote/code-server/settings.json` | `~/.local/share/code-server/User/settings.json` |
+| `remote/code-server-extension/*` | `~/.local/share/code-server/extensions/local.claude-snooze-1.0.0/` |
+| `remote/tmux-mobile/` | `~/tmux-mobile/` (then `npm install && npm run build`) |
+| `remote/tmux-mobile/tmux-mobile.service` | `~/.config/systemd/user/tmux-mobile.service` |
+| `remote/notifications/notify-server.js` | `~/.claude/notify-server.js` |
+| `remote/notifications/notify-stop.sh` | `~/.claude/hooks/notify-stop.sh` |
+| `remote/notifications/claude-notify.service` | `~/.config/systemd/user/claude-notify.service` |
+| `remote/notifications/notify-local.ps1` | `~\.claude\hooks\notify-local.ps1` (Windows, optional) |
+| `remote/claude-settings.json` | Merge into `~/.claude/settings.json` |
+
+### Dependencies (Remote, additional)
+- **code-server**: `curl -fsSL https://code-server.dev/install.sh \| sh`
+- **Tailscale**: On both machine and phone/laptop
+- **node-pty**: Native addon, installed via `npm install` in tmux-mobile
+
+---
+
+## 6. agent-browser Profiles
 
 Create persistent browser profiles for each service that needs login sessions:
 ```bash
@@ -166,7 +212,7 @@ agent-browser --session {service} --profile ~/.agent-browser/profiles/{service} 
 
 ---
 
-## 6. Chrome Anti-Invalidation (`lucy/bin/chrome-start`)
+## 7. Chrome Anti-Invalidation (`lucy/bin/chrome-start`)
 
 The `chrome-start` script launches Chrome with flags that prevent session revocation. Review and update:
 - The Chrome binary path (default assumes Windows Chrome via WSL2)
@@ -175,7 +221,7 @@ The `chrome-start` script launches Chrome with flags that prevent session revoca
 
 ---
 
-## 7. Third-Party Tools
+## 8. Third-Party Tools
 
 ### gstack (Playwright-based browser)
 Install separately:
