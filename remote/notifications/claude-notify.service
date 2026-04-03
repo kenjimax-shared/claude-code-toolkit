@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code Notification Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.claude/notify-server.js
+Restart=always
+RestartSec=3
+WorkingDirectory=%h/.claude
+# Optional: set your ntfy topic via environment
+# Environment=NTFY_TOPIC=your-random-topic-here
+
+[Install]
+WantedBy=default.target

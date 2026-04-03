@@ -1,0 +1,43 @@
+[
+    {
+        "key": "shift+enter",
+        "command": "workbench.action.terminal.sendSequence",
+        "args": {
+            "text": "\u001b\r"
+        },
+        "when": "terminalFocus"
+    },
+    {
+        "key": "ctrl+shift+`",
+        "command": "workbench.action.terminal.new",
+        "when": "false"
+    },
+    {
+        "key": "ctrl+shift+`",
+        "command": "runCommands",
+        "when": "terminalFocus",
+        "args": {
+            "commands": [
+                "workbench.action.terminal.split",
+                {
+                    "command": "workbench.action.terminal.sendSequence",
+                    "args": { "text": "cd ~/Claude && tmux new-session claude\\ --dangerously-skip-permissions\n" }
+                }
+            ]
+        }
+    },
+    {
+        "key": "ctrl+shift+1",
+        "command": "runCommands",
+        "when": "terminalFocus",
+        "args": {
+            "commands": [
+                "workbench.action.terminal.split",
+                {
+                    "command": "workbench.action.terminal.sendSequence",
+                    "args": { "text": "cd ~/Claude && (tmux attach \\; choose-tree -Zs || tmux new-session claude\\ --dangerously-skip-permissions)\n" }
+                }
+            ]
+        }
+    }
+]

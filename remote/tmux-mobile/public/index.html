@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>tmux mobile</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/dist/app.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <div class="header">
+      <button class="menu-btn" id="menu-btn">&#9776;</button>
+      <span class="session-name" id="session-name">connecting...</span>
+      <div class="status-dot" id="status-dot"></div>
+      <button class="menu-btn" id="fullscreen-btn" title="Fullscreen">&#x26F6;</button>
+    </div>
+
+    <!-- Terminal -->
+    <div class="terminal-wrap" id="terminal"></div>
+
+    <!-- Session drawer -->
+    <div class="drawer-overlay" id="drawer-overlay"></div>
+    <div class="drawer" id="drawer">
+      <div class="drawer-header">
+        <span>Sessions</span>
+        <button class="refresh-btn" id="refresh-btn">&#8635;</button>
+      </div>
+      <div class="session-list" id="session-list"></div>
+    </div>
+  </div>
+
+  <script src="/dist/app.js"></script>
+  <script>
+    // Register service worker (required for PWA standalone mode)
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js');
+    }
+  </script>
+</body>
+</html>

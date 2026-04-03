@@ -1,0 +1,333 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --header-h: 44px;
+  --input-h: 52px;
+  --bg: #1a1a2e;
+  --surface: #16213e;
+  --accent: #0f3460;
+  --text: #e0e0e0;
+  --text-dim: #888;
+  --green: #4ecca3;
+  --red: #e74c3c;
+}
+
+html, body {
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  -webkit-text-size-adjust: 100%;
+  touch-action: manipulation;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+  will-change: height, transform;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  height: var(--header-h);
+  padding: 0 12px;
+  background: var(--surface);
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+  gap: 10px;
+}
+
+.header .menu-btn {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 20px;
+  padding: 4px 8px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.header .session-name {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header .status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--red);
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+
+.header .status-dot.connected {
+  background: var(--green);
+}
+
+/* Terminal container */
+.terminal-wrap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.terminal-wrap .xterm {
+  height: 100%;
+}
+
+/* Input bar */
+.input-bar {
+  display: flex;
+  align-items: center;
+  height: var(--input-h);
+  padding: 6px 8px;
+  background: var(--surface);
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.input-bar input[type="text"] {
+  flex: 1;
+  height: 38px;
+  padding: 0 12px;
+  background: #0d1b2a;
+  border: 1px solid #333;
+  border-radius: 20px;
+  color: var(--text);
+  font-size: 15px;
+  outline: none;
+}
+
+.input-bar input[type="text"]:focus {
+  border-color: var(--green);
+}
+
+.input-bar button {
+  width: 38px;
+  height: 38px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.input-bar button:active {
+  opacity: 0.7;
+}
+
+.input-bar button.kb-toggle.active {
+  background: var(--green);
+  color: #000;
+}
+
+/* Session drawer */
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 100;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+.drawer-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 90vw;
+  max-width: 90vw;
+  background: var(--surface);
+  z-index: 101;
+  transform: translateX(-100%);
+  transition: transform 0.25s ease;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.drawer.open {
+  transform: translateX(0);
+}
+
+.drawer-header {
+  padding: 16px;
+  font-size: 16px;
+  font-weight: 700;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.drawer-header .refresh-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.session-item {
+  padding: 14px 16px;
+  border-bottom: 1px solid #222;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.session-item:active {
+  background: var(--accent);
+}
+
+.session-item.active {
+  background: var(--accent);
+  border-left: 3px solid var(--green);
+}
+
+.session-item .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.session-item .dot.attached {
+  background: var(--green);
+}
+
+.session-item .info {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-item .info .name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-item .info .meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.session-item .kill-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  padding: 4px 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.session-item .kill-btn:active {
+  color: var(--red);
+}
+
+.session-item.new-session-btn {
+  border-bottom: 2px solid #333;
+}
+
+.session-item .new-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--green);
+  color: #000;
+  font-size: 18px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* Text selection overlay */
+.select-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.select-overlay-close {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid #333;
+  color: var(--green);
+  font-size: 15px;
+  font-weight: 600;
+  text-align: right;
+  cursor: pointer;
+}
+
+.select-overlay-hint {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.select-overlay-text {
+  flex: 1;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px;
+  margin: 0;
+  font-family: 'Cascadia Code', 'Fira Code', 'Menlo', monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: pre;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}

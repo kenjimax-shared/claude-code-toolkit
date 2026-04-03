@@ -1,0 +1,10 @@
+{
+  "name": "claude-snooze",
+  "publisher": "local",
+  "displayName": "Claude Snooze Resume",
+  "description": "Opens a terminal in the editor area when a snoozed Claude session is ready",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.80.0" },
+  "activationEvents": ["*"],
+  "main": "./extension.js"
+}

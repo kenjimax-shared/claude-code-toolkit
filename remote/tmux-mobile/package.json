@@ -1,0 +1,23 @@
+{
+  "name": "tmux-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "node-pty": "^1.1.0-beta29",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "esbuild": "^0.25.0"
+  }
+}

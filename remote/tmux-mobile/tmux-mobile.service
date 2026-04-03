@@ -1,0 +1,14 @@
+[Unit]
+Description=tmux mobile dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tmux-mobile
+ExecStart=/usr/bin/node %h/tmux-mobile/server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
