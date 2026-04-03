@@ -18,3 +18,4 @@
 0 3 * * 0 /home/user/.claude/mcp-health-check --quiet >> /home/user/.claude/mcp-health-check.log 2>&1
 # Claude snooze: Check Statsig v5 experiment data after overnight collection
 0 8 3 4 * /home/user/.claude/snooze-resume.sh fdfd62a2-d2be-4fc4-9aaf-ff7956bd7066 "Check Statsig v5 experiment data after overnight collection" "exampleco-metrics-debug"
+0 6 * * * /usr/bin/python3 /home/user/Claude/totp-ext/bridge/totp-bridge.py --rebuild-cache >/dev/null 2>&1

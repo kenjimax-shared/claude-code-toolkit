@@ -70,6 +70,11 @@
             "command": "bash \"$HOME/.claude/disk-check.sh\"",
             "timeout": 5,
             "statusMessage": "Checking disk space..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/ab-no-reopen.sh\"",
+            "timeout": 5
           }
         ]
       },

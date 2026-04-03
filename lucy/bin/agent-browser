@@ -13,6 +13,10 @@
 
 REAL="$HOME/.npm-global/bin/agent-browser"
 PROFILES="$HOME/.agent-browser/profiles"
+
+# Inject Chrome flags to prevent renderer backgrounding/throttling/freezing (fixes idle session death)
+_AB_STABILITY_FLAGS="--disable-renderer-backgrounding,--disable-background-timer-throttling,--disable-ipc-flooding-protection,--disable-features=IntensiveWakeUpThrottling:TabFreezing:AutomaticTabDiscarding:ProactiveTabFreezeAndDiscard"
+export AGENT_BROWSER_ARGS="${AGENT_BROWSER_ARGS:+${AGENT_BROWSER_ARGS},}${_AB_STABILITY_FLAGS}"
 OWNERS="$HOME/.agent-browser/terminal-owners"
 SESSIONS="$HOME/.agent-browser/sessions"
 TAG="[ab-safe]"

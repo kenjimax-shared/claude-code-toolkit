@@ -82,7 +82,10 @@ export class SessionList {
       return;
     }
 
-    for (const s of this.sessions) {
+    // Only show alive sessions (Claude running) — dead shells are auto-cleaned
+    const liveSessions = this.sessions.filter(s => s.alive);
+
+    for (const s of liveSessions) {
       const el = document.createElement('div');
       el.className = 'session-item' + (s.name === this.activeSession ? ' active' : '');
 

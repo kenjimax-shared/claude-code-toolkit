@@ -39,16 +39,19 @@ fi
 # ── Strategy 2: Prose pattern matching (broader than before) ──
 if [ -z "$TRIGGERED" ]; then
   # Memory-related phrases (catches more variations with regex)
+  # Strip code references (backtick content, filenames with extensions) before matching
+  MSG_PROSE=$(echo "$MSG_LOWER" | sed -E 's/`[^`]*`//g; s/[a-z0-9_-]+\.(sh|py|js|ts|md|json|yaml|yml|toml)//g')
+
   MEMORY_PATTERNS=(
-    "saved.*memory"
-    "updated.*memory"
-    "update.*feedback"
-    "written.*memory"
-    "stored.*memory"
-    "noted.*memory"
-    "added.*memory"
-    "recorded.*feedback"
-    "saved.*feedback"
+    "saved.{0,20}memory"
+    "updated.{0,20}memory"
+    "update.{0,15}feedback.{0,15}(file|memory)"
+    "written.{0,20}memory"
+    "stored.{0,20}memory"
+    "noted.{0,20}memory"
+    "added.{0,20}memory"
+    "recorded.{0,15}feedback"
+    "saved.{0,15}feedback"
   )
 
   PROMISE_PATTERNS=(
@@ -73,7 +76,7 @@ if [ -z "$TRIGGERED" ]; then
   )
 
   for pattern in "${MEMORY_PATTERNS[@]}"; do
-    if echo "$MSG_LOWER" | grep -qE "$pattern"; then
+    if echo "$MSG_PROSE" | grep -qE "$pattern"; then
       TRIGGERED="prose: $pattern"
       break
     fi

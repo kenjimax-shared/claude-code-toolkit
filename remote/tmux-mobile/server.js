@@ -5,7 +5,7 @@ import { spawn } from 'node-pty';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { createReadStream, statSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
+import { createReadStream, statSync, writeFileSync, unlinkSync, mkdirSync, readdirSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3200', 10);
@@ -36,13 +36,47 @@ app.use('/dist', express.static(join(__dirname, 'dist')));
 // doesn't trigger tmux client-detach (which would fire destroy-unattached)
 const activePTYs = new Map();
 
-// REST: list tmux sessions
+// Patterns for sessions that should be hidden from mobile
+const HIDDEN_SESSION_PATTERNS = [
+  /^lucy-/,          // Lucy orchestration sessions
+];
+
+function isHiddenSession(name) {
+  return HIDDEN_SESSION_PATTERNS.some(p => p.test(name));
+}
+
+// Build a map of session -> whether Claude is running (not just a dead bash shell)
+function getAliveMap() {
+  try {
+    const raw = execSync('tmux list-panes -a -F "#{session_name}|#{pane_current_command}"', {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    const map = new Map();
+    for (const line of raw.trim().split('\n').filter(Boolean)) {
+      const sep = line.indexOf('|');
+      if (sep === -1) continue;
+      const sess = line.substring(0, sep);
+      const cmd = line.substring(sep + 1).trim();
+      // If any pane runs something other than a bare shell, session is alive
+      const isShell = ['bash', 'sh', 'zsh', 'fish', ''].includes(cmd);
+      if (!isShell) map.set(sess, true);
+      else if (!map.has(sess)) map.set(sess, false);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+// REST: list tmux sessions (filtered: no Lucy sessions, includes alive status)
 app.get('/api/sessions', (_req, res) => {
   try {
     const raw = execSync('tmux list-sessions -F "#{session_name}|#{session_windows}|#{session_attached}|#{session_activity}"', {
       encoding: 'utf8',
       timeout: 3000,
     });
+    const aliveMap = getAliveMap();
     const sessions = raw.trim().split('\n').filter(Boolean).map(line => {
       const [name, windows, attached, activity] = line.split('|');
       return {
@@ -50,8 +84,9 @@ app.get('/api/sessions', (_req, res) => {
         windows: parseInt(windows, 10),
         attached: parseInt(attached, 10) > 0,
         lastActivity: parseInt(activity, 10),
+        alive: aliveMap.get(name) || false,
       };
-    });
+    }).filter(s => !isHiddenSession(s.name));
     res.json(sessions);
   } catch {
     res.json([]);
@@ -290,6 +325,53 @@ setInterval(() => {
     activePTYs.clear();
   }
 }, 30000);
+
+// Auto-cleanup: kill tmux sessions where Claude is no longer running
+// Runs every 2 minutes. Only kills sessions that:
+// 1. Have no Claude process (only a bare shell)
+// 2. Have no snooze-active marker (not awaiting scheduled resume)
+// 3. Have been idle for > 5 minutes
+// 4. Are not hidden (Lucy) sessions — those are managed separately
+const IDLE_THRESHOLD_SEC = 300; // 5 minutes
+setInterval(() => {
+  try {
+    const aliveMap = getAliveMap();
+    const markers = new Set();
+    try { for (const f of readdirSync(SNOOZE_DIR)) markers.add(f); } catch {}
+
+    const raw = execSync('tmux list-sessions -F "#{session_name}|#{session_attached}|#{session_activity}"', {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    const now = Math.floor(Date.now() / 1000);
+    for (const line of raw.trim().split('\n').filter(Boolean)) {
+      const [name, attached, activity] = line.split('|');
+      const idle = now - parseInt(activity, 10);
+      const isAttached = parseInt(attached, 10) > 0;
+
+      // Skip if alive (Claude is running)
+      if (aliveMap.get(name)) continue;
+      // Skip if attached from code-server (user may still be looking at it)
+      if (isAttached) continue;
+      // Skip if has snooze marker (scheduled for resume)
+      if (markers.has(name)) continue;
+      // Skip if hidden (Lucy) — managed by Lucy orchestrator
+      if (isHiddenSession(name)) continue;
+      // Skip if not idle long enough
+      if (idle < IDLE_THRESHOLD_SEC) continue;
+
+      console.log(`[auto-cleanup] killing dead session: ${name} (idle ${idle}s, no claude process)`);
+      // Clean up PTY if we have one
+      const entry = activePTYs.get(name);
+      if (entry) {
+        entry.pty.kill();
+        activePTYs.delete(name);
+      }
+      try { unlinkSync(join(SNOOZE_DIR, name)); } catch {}
+      try { execSync(`tmux kill-session -t ${JSON.stringify(name)}`, { timeout: 3000 }); } catch {}
+    }
+  } catch {}
+}, 120000); // Every 2 minutes
 
 let bindAttempts = 0;
 const MAX_PORT_ATTEMPTS = 10;
