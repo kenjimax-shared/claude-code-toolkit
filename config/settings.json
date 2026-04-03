@@ -27,6 +27,11 @@
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/name-session.sh\"",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/auto-eval-skip.sh\"",
+            "timeout": 3
           }
         ]
       }
@@ -74,6 +79,11 @@
           {
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/ab-no-reopen.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/no-headless-testing.sh\"",
             "timeout": 5
           }
         ]
@@ -168,6 +178,11 @@
           },
           {
             "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/url-verification-gate.sh\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash \"$HOME/.claude/hooks/fix-last-prompt.sh\"",
             "timeout": 5
           },
@@ -194,6 +209,11 @@
           {
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/cleanup-owner.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/auto-eval.sh\"",
             "timeout": 5
           }
         ]

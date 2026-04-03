@@ -24,6 +24,10 @@ TAG="[ab-safe]"
 [[ -x "$REAL" ]] || { echo "$TAG binary not found: $REAL" >&2; exit 1; }
 mkdir -p "$OWNERS"
 
+# --- Per-terminal session limit ---
+# Prevents agents from spawning unlimited Chrome instances by inventing new session names.
+MAX_SESSIONS_PER_TERMINAL=3
+
 # --- Workaround: --session-name auto-load is broken in agent-browser >=0.23 ---
 # The native --session-name flag does NOT restore cookies on startup.
 # Fix: open about:blank first, load state synchronously, then navigate to the real URL.
@@ -216,26 +220,46 @@ fi
 # --- Handle 'open'/'connect' with a named session ---
 if $is_open && [[ -n "$session" ]]; then
 
-    # Check if this terminal already has a derivative for this session
+    # --- Transparent re-open: if THIS terminal already has this session, just navigate ---
+    # This is the key fix: agents never see a "blocked" error, so they never invent new names.
+    tracking_file="$OWNERS/${TERMINAL_ID}.sessions"
+
+    # Case 1: This terminal has a derivative for this session → navigate the derivative
     existing_deriv=$(get_derivative "$session")
     if [[ -n "$existing_deriv" ]] && is_session_alive "$existing_deriv"; then
-        # Reuse existing derivative: navigate it instead of creating a new one
-        echo "$TAG reusing derivative '$existing_deriv' for '$session'" >&2
-        new_args=()
-        for ((i=0; i<${#args[@]}; i++)); do
-            if [[ "${args[i]}" == "--session" ]] && [[ $((i+1)) -lt ${#args[@]} ]]; then
-                new_args+=("--session" "$existing_deriv")
-                ((i++))
-            else
-                new_args+=("${args[i]}")
-            fi
-        done
-        exec "$REAL" "${new_args[@]}"
+        echo "$TAG reusing derivative '$existing_deriv' (navigating to ${url_arg:-current page})" >&2
+        if [[ -n "$url_arg" ]]; then
+            "$REAL" --session "$existing_deriv" navigate "$url_arg" 2>&1
+        else
+            "$REAL" --session "$existing_deriv" snapshot 2>&1
+        fi
+        exit $?
     fi
 
-    # Check if the base session daemon is already alive (another terminal or user owns it)
+    # Case 2: This terminal owns the primary session → navigate it
+    if [[ -f "$tracking_file" ]] && grep -qxF "$session" "$tracking_file" 2>/dev/null && is_session_alive "$session"; then
+        echo "$TAG reusing own session '$session' (navigating to ${url_arg:-current page})" >&2
+        if [[ -n "$url_arg" ]]; then
+            "$REAL" --session "$session" navigate "$url_arg" 2>&1
+        else
+            "$REAL" --session "$session" snapshot 2>&1
+        fi
+        exit $?
+    fi
+
+    # (No per-terminal session limit — agents legitimately need multiple browsers.
+    #  The transparent re-open logic above prevents name-invention proliferation.)
+
+    # --- Cross-terminal: another terminal owns this session → create derivative ---
     if is_session_alive "$session"; then
-        # Session exists; create a derivative so we don't touch the existing tab
+        # Anti-cascade: don't create derivatives of derivatives
+        if [[ "$session" == *"--${TERMINAL_ID}" ]] || grep -rq "=${session}$" "$OWNERS/"*.map 2>/dev/null; then
+            echo "$TAG navigating existing session '$session' (anti-cascade)" >&2
+            "$REAL" --session "$session" navigate ${url_arg:+"$url_arg"} 2>&1
+            exit $?
+        fi
+
+        # Create a derivative so we don't touch the other terminal's tab
         derivative="${session}--${TERMINAL_ID}"
         deriv_profile="$PROFILES/$derivative"
         echo "$TAG session '$session' is in use; creating derivative '$derivative'" >&2

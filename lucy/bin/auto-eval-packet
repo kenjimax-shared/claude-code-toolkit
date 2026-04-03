@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Extract a structured review packet from a Claude Code JSONL transcript.
+
+Reads the transcript, identifies mutations (writes, edits, destructive bash,
+MCP state changes), user messages, and key decisions. Outputs a markdown
+review packet suitable for an adversarial reviewer.
+
+Usage: auto-eval-packet <transcript.jsonl> [--tmux-name NAME]
+"""
+import json, sys, os, re
+from datetime import datetime
+
+MUTATION_TOOLS = {"Edit", "Write", "NotebookEdit"}
+
+# MCP tool name fragments that indicate state mutation
+MCP_MUTATE_FRAGMENTS = {
+    "create", "update", "delete", "send", "push", "write", "modify",
+    "manage", "set", "add", "remove", "assign", "merge", "publish",
+    "draft", "move", "batch_update", "insert", "format", "mutate",
+    "deploy", "copy", "fork", "comment", "reply", "review",
+}
+
+# MCP tool name fragments that are read-only
+MCP_READ_FRAGMENTS = {
+    "get", "list", "read", "search", "fetch", "describe", "inspect",
+    "debug", "check", "query", "run_report", "run_realtime_report",
+    "find", "summarize",
+}
+
+# Bash commands that mutate state
+BASH_MUTATE_PATTERNS = [
+    r'\bgit\s+push\b', r'\bgit\s+commit\b', r'\bgit\s+reset\b',
+    r'\bgit\s+merge\b', r'\bgit\s+rebase\b', r'\bgit\s+tag\b',
+    r'\bgh\s+pr\s+create\b', r'\bgh\s+issue\s+create\b',
+    r'\bgh\s+pr\s+merge\b', r'\bgh\s+pr\s+comment\b',
+    r'\bgh\s+issue\s+comment\b', r'\bgh\s+label\s+create\b',
+    r'\bgh\s+repo\s+create\b',
+    r'\bcurl\s+.*-X\s*(POST|PUT|PATCH|DELETE)\b',
+    r'\brm\s+-', r'\brm\s+[^-]',
+    r'\bmv\s+', r'\bcp\s+',
+    r'\bmkdir\b', r'\bchmod\b', r'\bchown\b',
+    r'\bsed\s+-i\b',
+    r'\bpip\s+install\b', r'\bnpm\s+install\b', r'\bapt\s+install\b',
+    r'\bgcloud\s+functions\s+deploy\b', r'\bgcloud\s+.*create\b',
+    r'\bdocker\s+push\b',
+    r'\bkubectl\s+apply\b', r'\bkubectl\s+delete\b',
+    r'\bagent-browser\b',
+    r'>\s', r'>>\s',  # redirects
+]
+BASH_MUTATE_RE = re.compile('|'.join(BASH_MUTATE_PATTERNS), re.IGNORECASE)
+
+
+def is_mcp_mutation(tool_name):
+    """Check if an MCP tool name indicates a mutation."""
+    lower = tool_name.lower()
+    # Check read fragments first (higher priority)
+    for frag in MCP_READ_FRAGMENTS:
+        if frag in lower:
+            return False
+    for frag in MCP_MUTATE_FRAGMENTS:
+        if frag in lower:
+            return True
+    return False
+
+
+def is_bash_mutation(command):
+    """Check if a bash command mutates state."""
+    return bool(BASH_MUTATE_RE.search(command))
+
+
+def summarize_input(tool_name, inp):
+    """Create a one-line summary of a tool call's input."""
+    if tool_name == "Edit":
+        fp = inp.get("file_path", "?")
+        old = (inp.get("old_string", "") or "")[:60]
+        new = (inp.get("new_string", "") or "")[:60]
+        return f"{fp}: '{old}' -> '{new}'"
+    elif tool_name == "Write":
+        fp = inp.get("file_path", "?")
+        content = (inp.get("content", "") or "")[:80]
+        return f"{fp} ({len(inp.get('content', ''))} chars)"
+    elif tool_name == "Bash":
+        cmd = inp.get("command", "")[:200]
+        return cmd
+    elif tool_name == "Agent":
+        desc = inp.get("description", "")
+        prompt = (inp.get("prompt", "") or "")[:100]
+        return f"{desc}: {prompt}"
+    elif tool_name.startswith("mcp__"):
+        # Show key params
+        parts = []
+        for k, v in inp.items():
+            if isinstance(v, str) and len(v) < 100:
+                parts.append(f"{k}={v}")
+            elif isinstance(v, (int, float, bool)):
+                parts.append(f"{k}={v}")
+        return ", ".join(parts[:5]) or "(complex input)"
+    else:
+        return json.dumps(inp)[:150]
+
+
+def extract_packet(transcript_path, tmux_name=""):
+    user_msgs = []
+    mutations = []
+    all_tools = []
+    assistant_texts = []
+    first_ts = None
+    last_ts = None
+    models_used = set()
+
+    with open(transcript_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+
+            etype = entry.get("type")
+            ts = entry.get("timestamp")
+            if ts and not first_ts:
+                first_ts = ts
+            if ts:
+                last_ts = ts
+
+            if etype == "user":
+                msg = entry.get("message", {}).get("content", "")
+                if isinstance(msg, str) and msg.strip() and not msg.strip().startswith("<"):
+                    user_msgs.append(msg.strip()[:500])
+                elif isinstance(msg, list):
+                    for block in msg:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text = block.get("text", "").strip()
+                                if text and not text.startswith("<"):
+                                    user_msgs.append(text[:500])
+
+            if etype == "assistant":
+                model = entry.get("message", {}).get("model", "")
+                if model:
+                    models_used.add(model)
+
+                content = entry.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+
+                    if block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        if text:
+                            assistant_texts.append(text)
+
+                    if block.get("type") == "tool_use":
+                        name = block.get("name", "")
+                        inp = block.get("input", {})
+                        all_tools.append(name)
+
+                        is_mutation = False
+                        if name in MUTATION_TOOLS:
+                            is_mutation = True
+                        elif name == "Bash":
+                            cmd = inp.get("command", "")
+                            is_mutation = is_bash_mutation(cmd)
+                        elif name.startswith("mcp__"):
+                            is_mutation = is_mcp_mutation(name)
+                        elif name == "Agent":
+                            is_mutation = True  # agents can do anything
+
+                        if is_mutation:
+                            summary = summarize_input(name, inp)
+                            mutations.append(f"[{name}] {summary}")
+
+    # Calculate duration
+    duration_str = "unknown"
+    if first_ts and last_ts:
+        try:
+            t1 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            mins = int((t2 - t1).total_seconds() / 60)
+            duration_str = f"~{mins}m"
+        except Exception:
+            pass
+
+    session_id = os.path.basename(transcript_path).replace(".jsonl", "")
+
+    # Build packet
+    lines = []
+    lines.append("# Auto-Eval Review Packet\n")
+    lines.append("## Session Info")
+    lines.append(f"- **Session**: `{session_id}`")
+    if tmux_name:
+        lines.append(f"- **Terminal**: `{tmux_name}`")
+    lines.append(f"- **Duration**: {duration_str}")
+    lines.append(f"- **Total tool calls**: {len(all_tools)}")
+    lines.append(f"- **Mutations**: {len(mutations)}")
+    if models_used:
+        lines.append(f"- **Models**: {', '.join(sorted(models_used))}")
+    lines.append("")
+
+    lines.append("## Task (User Messages)")
+    for i, msg in enumerate(user_msgs[:10], 1):
+        first_line = msg.split("\n")[0][:300]
+        lines.append(f"{i}. {first_line}")
+    if len(user_msgs) > 10:
+        lines.append(f"... and {len(user_msgs) - 10} more messages")
+    lines.append("")
+
+    if mutations:
+        lines.append("## Mutations (Changes Made)")
+        for i, mut in enumerate(mutations[:40], 1):
+            lines.append(f"{i}. {mut}")
+        if len(mutations) > 40:
+            lines.append(f"... and {len(mutations) - 40} more mutations")
+    else:
+        lines.append("## Mutations (Changes Made)")
+        lines.append("*No state-changing operations detected (read-only session)*")
+    lines.append("")
+
+    # Key decisions: last few substantial assistant texts
+    decision_texts = [t for t in assistant_texts if len(t) > 100]
+    if decision_texts:
+        lines.append("## Key Decisions / Reasoning")
+        for text in decision_texts[-5:]:
+            # Take first 300 chars of each
+            excerpt = text[:300].replace("\n", " ")
+            lines.append(f"- {excerpt}")
+        lines.append("")
+
+    # Final output
+    if assistant_texts:
+        lines.append("## Final Output")
+        final = assistant_texts[-1][:500]
+        lines.append(final)
+        lines.append("")
+
+    # Tool usage summary
+    from collections import Counter
+    tool_counts = Counter(all_tools)
+    lines.append("## Tool Usage Summary")
+    for tool, count in tool_counts.most_common(15):
+        lines.append(f"- {tool}: {count}")
+
+    return "\n".join(lines), len(mutations), len(all_tools)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: auto-eval-packet <transcript.jsonl> [--tmux-name NAME]", file=sys.stderr)
+        sys.exit(1)
+
+    transcript = sys.argv[1]
+    tmux_name = ""
+    if "--tmux-name" in sys.argv:
+        idx = sys.argv.index("--tmux-name")
+        if idx + 1 < len(sys.argv):
+            tmux_name = sys.argv[idx + 1]
+
+    packet, mutation_count, tool_count = extract_packet(transcript, tmux_name)
+    print(packet)
+
+    # Write stats to stderr for the caller
+    print(json.dumps({
+        "mutation_count": mutation_count,
+        "tool_count": tool_count
+    }), file=sys.stderr)

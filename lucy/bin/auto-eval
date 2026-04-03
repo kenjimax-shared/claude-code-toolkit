@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# auto-eval: Automated adversarial review of Claude Code sessions
+# Called by the stop hook (auto-eval.sh) with session JSON as $1
+#
+# Flow:
+#   1. Extract review packet from transcript
+#   2. Call OpenAI API (gpt-4.1-mini) for lightweight review
+#   3. Post result as GitHub issue in user-org/auto-eval
+#   4. If ESCALATE, spawn a tmux session for full review
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../config.sh"
+
+REPO="user-org/auto-eval"
+REVIEW_MODEL="${AUTO_EVAL_MODEL:-gpt-4.1-mini}"
+REVIEW_PROMPT_FILE="$SCRIPT_DIR/../templates/auto-eval-review.md"
+PACKET_SCRIPT="$SCRIPT_DIR/auto-eval-packet"
+
+# Parse input (JSON string passed as $1)
+INPUT="$1"
+SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
+[ -z "$SESSION_ID" ] && exit 0
+
+# ── Skip conditions ──
+
+# Skip if SKIP_REVIEW env var is set
+[ "${SKIP_REVIEW:-}" = "1" ] && exit 0
+
+# Skip if user said "skip end review" during the session
+SKIP_FLAG="$HOME/.claude/auto-eval-skip/$SESSION_ID"
+if [ -f "$SKIP_FLAG" ]; then
+  rm -f "$SKIP_FLAG"
+  exit 0
+fi
+
+# Skip Lucy sub-agent sessions
+TMUX_NAME=""
+if [ -n "${TMUX:-}" ]; then
+  TMUX_NAME=$(tmux display-message -p '#S' 2>/dev/null || true)
+fi
+# Also check session-tmux-owners for the name
+if [ -z "$TMUX_NAME" ]; then
+  for owner_file in "$HOME/.claude/session-tmux-owners"/*; do
+    [ -f "$owner_file" ] || continue
+    if [ "$(cat "$owner_file" 2>/dev/null)" = "$SESSION_ID" ]; then
+      TMUX_NAME=$(basename "$owner_file")
+      break
+    fi
+  done
+fi
+
+# Skip Lucy agent sessions and eval sessions (prevent loops)
+case "$TMUX_NAME" in
+  lucy-*|eval-*) exit 0 ;;
+esac
+
+# Skip if OpenAI API key is not available
+[ -z "${OPENAI_API_KEY:-}" ] && exit 0
+
+# Dedup: skip if we already reviewed this session
+DEDUP_DIR="$HOME/.claude/auto-eval-done"
+mkdir -p "$DEDUP_DIR"
+if [ -f "$DEDUP_DIR/$SESSION_ID" ]; then
+  exit 0
+fi
+
+# ── Find transcript ──
+
+TRANSCRIPT=""
+for dir in "$HOME/.claude/projects/-home-user-Claude" "$HOME/.claude/projects/-mnt-c-Users-user-Claude"; do
+  if [ -f "$dir/${SESSION_ID}.jsonl" ]; then
+    TRANSCRIPT="$dir/${SESSION_ID}.jsonl"
+    break
+  fi
+done
+[ -z "$TRANSCRIPT" ] && exit 0
+
+# ── Generate review packet ──
+
+STATS_FILE=$(mktemp /tmp/auto-eval-stats-XXXXXX)
+PACKET=$(python3 "$PACKET_SCRIPT" "$TRANSCRIPT" --tmux-name "$TMUX_NAME" 2>"$STATS_FILE")
+
+# Read stats
+MUTATION_COUNT=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('mutation_count',0))" < "$STATS_FILE" 2>/dev/null || echo "0")
+TOOL_COUNT=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('tool_count',0))" < "$STATS_FILE" 2>/dev/null || echo "0")
+rm -f "$STATS_FILE"
+
+# Skip trivial sessions (< 3 tool calls and no mutations)
+if [ "$TOOL_COUNT" -lt 3 ] && [ "$MUTATION_COUNT" -eq 0 ]; then
+  exit 0
+fi
+
+# ── Call API for review ──
+
+SYSTEM_PROMPT=$(cat "$REVIEW_PROMPT_FILE")
+
+# Build the API request using env vars (avoids shell interpolation issues)
+PACKET_FILE=$(mktemp /tmp/auto-eval-packet-XXXXXX.md)
+echo "$PACKET" > "$PACKET_FILE"
+
+API_RESPONSE=$(REVIEW_PROMPT_FILE="$REVIEW_PROMPT_FILE" REVIEW_MODEL="$REVIEW_MODEL" PACKET_FILE="$PACKET_FILE" python3 -c "
+import json, sys, os
+system = open(os.environ['REVIEW_PROMPT_FILE']).read()
+packet = open(os.environ['PACKET_FILE']).read()
+print(json.dumps({
+    'model': os.environ['REVIEW_MODEL'],
+    'messages': [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': packet}
+    ],
+    'temperature': 0.3,
+    'max_tokens': 1000
+}))
+" | curl -s --max-time 30 "https://api.openai.com/v1/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @- 2>/dev/null)
+
+rm -f "$PACKET_FILE"
+
+# Extract the review content
+REVIEW_JSON=$(echo "$API_RESPONSE" | python3 -c "
+import json, sys
+try:
+    resp = json.load(sys.stdin)
+    content = resp['choices'][0]['message']['content']
+    # Parse the JSON response (strip markdown fences if present)
+    content = content.strip()
+    if content.startswith('\`\`\`'):
+        content = content.split('\n', 1)[1].rsplit('\`\`\`', 1)[0].strip()
+    parsed = json.loads(content)
+    print(json.dumps(parsed))
+except Exception as e:
+    print(json.dumps({
+        'verdict': 'FLAG',
+        'confidence': 'low',
+        'summary': f'Auto-eval API call failed: {e}',
+        'concerns': ['Review could not be completed'],
+        'positive': [],
+        'escalation_reason': None
+    }))
+" 2>/dev/null)
+
+# Parse verdict
+VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('verdict','FLAG'))" 2>/dev/null)
+SUMMARY=$(echo "$REVIEW_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('summary','No summary'))" 2>/dev/null)
+CONFIDENCE=$(echo "$REVIEW_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('confidence','low'))" 2>/dev/null)
+CONCERNS=$(echo "$REVIEW_JSON" | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+concerns = data.get('concerns', [])
+if concerns:
+    for c in concerns:
+        print(f'- {c}')
+else:
+    print('None')
+" 2>/dev/null)
+POSITIVES=$(echo "$REVIEW_JSON" | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+pos = data.get('positive', [])
+if pos:
+    for p in pos:
+        print(f'- {p}')
+" 2>/dev/null)
+ESCALATION_REASON=$(echo "$REVIEW_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin).get('escalation_reason'); print(r if r else '')" 2>/dev/null)
+
+# ── Post to GitHub ──
+
+VERDICT_LOWER=$(echo "$VERDICT" | tr '[:upper:]' '[:lower:]')
+LABEL="${VERDICT_LOWER}"
+TITLE_PREFIX="[${VERDICT}]"
+TMUX_DISPLAY="${TMUX_NAME:-${SESSION_ID:0:8}}"
+
+# Build issue body
+ISSUE_BODY="$(cat <<EOF
+## ${TITLE_PREFIX} ${TMUX_DISPLAY}
+
+**Verdict**: ${VERDICT} (confidence: ${CONFIDENCE})
+**Summary**: ${SUMMARY}
+**Session**: \`${SESSION_ID}\`
+**Terminal**: \`${TMUX_DISPLAY}\`
+**Mutations**: ${MUTATION_COUNT} | **Tool calls**: ${TOOL_COUNT}
+
+### Concerns
+${CONCERNS}
+
+### Positives
+${POSITIVES:-None noted}
+
+$([ -n "$ESCALATION_REASON" ] && echo "### Escalation Reason
+$ESCALATION_REASON" || true)
+
+<details>
+<summary>Review Packet</summary>
+
+${PACKET}
+
+</details>
+EOF
+)"
+
+# Create the issue
+gh issue create \
+  --repo "$REPO" \
+  --title "${TITLE_PREFIX} ${TMUX_DISPLAY}: $(echo "$SUMMARY" | head -c 60)" \
+  --body "$ISSUE_BODY" \
+  --label "$LABEL,auto" \
+  2>/dev/null || true
+
+# Mark session as reviewed (dedup)
+echo "$VERDICT" > "$DEDUP_DIR/$SESSION_ID"
+
+# ── Escalate if needed ──
+
+if [ "$VERDICT" = "ESCALATE" ]; then
+  EVAL_TMUX="eval-${SESSION_ID:0:8}"
+
+  # Write escalation prompt from template + dynamic data
+  ESCALATE_PROMPT_FILE=$(mktemp /tmp/auto-eval-escalate-XXXXXX.md)
+  ESCALATE_TEMPLATE="$SCRIPT_DIR/../templates/auto-eval-escalate.md"
+
+  if [ -f "$ESCALATE_TEMPLATE" ]; then
+    # Use Python for safe multi-line template injection
+    ESCALATION_REASON="$ESCALATION_REASON" \
+    REPO="$REPO" \
+    PACKET="$PACKET" \
+    CONCERNS="$CONCERNS" \
+    python3 -c "
+import os
+template = open('$ESCALATE_TEMPLATE').read()
+template = template.replace('{{ESCALATION_REASON}}', os.environ['ESCALATION_REASON'])
+template = template.replace('{{REPO}}', os.environ['REPO'])
+# Append dynamic sections
+template += '\n\n## Review Packet\n\n' + os.environ['PACKET']
+template += '\n\n## Concerns Flagged by Automated Review\n\n' + os.environ['CONCERNS']
+print(template)
+" > "$ESCALATE_PROMPT_FILE"
+  else
+    cat > "$ESCALATE_PROMPT_FILE" <<FALLBACK
+You are an independent adversarial verifier. A lightweight review flagged this session.
+
+## Why You Were Spawned
+${ESCALATION_REASON}
+
+## Review Packet
+${PACKET}
+
+## Concerns
+${CONCERNS}
+
+Independently verify each concern using live system access. Post findings via:
+gh issue comment --repo ${REPO} --body "<findings>"
+FALLBACK
+  fi
+
+  # Kill stale session if exists
+  tmux kill-session -t "$EVAL_TMUX" 2>/dev/null || true
+
+  # Spawn verification terminal (like snooze)
+  tmux new-session -d -s "$EVAL_TMUX" -c "/home/user/Claude" \
+    "claude --dangerously-skip-permissions --verbose -p \"\$(cat $ESCALATE_PROMPT_FILE)\" 2>&1; rm -f $ESCALATE_PROMPT_FILE; exit"
+
+  log "AUTO-EVAL ESCALATE: Spawned $EVAL_TMUX for session $SESSION_ID"
+fi
+
+log "AUTO-EVAL: $VERDICT for $TMUX_DISPLAY ($SESSION_ID) - $SUMMARY"

@@ -73,6 +73,20 @@ if [ -z "$TRIGGERED" ]; then
     "so this doesn't"
     "so this won't"
     "this is now fixed"
+    "won't skip"
+    "will not skip"
+    "won't forget"
+    "will not forget"
+    "won't do that again"
+    "will not do that again"
+    "won't miss that"
+    "will not miss that"
+    "that step again"
+    "that mistake again"
+    "won't overlook"
+    "will not overlook"
+    "won't happen next"
+    "will not happen next"
   )
 
   for pattern in "${MEMORY_PATTERNS[@]}"; do
