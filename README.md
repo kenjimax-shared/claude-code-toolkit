@@ -13,13 +13,20 @@ Claude Code hooks that fire on various lifecycle events:
 |------|-------|---------|
 | `name-session.sh` | UserPromptSubmit | Auto-names tmux sessions from first substantive prompt using Haiku |
 | `compact-suggest.sh` | PreToolUse | Suggests `/compact` after N tool calls to prevent context overflow |
+| `bash-injection-guard.sh` | PreToolUse (Bash) | Blocks dangerous patterns: curl\|bash, eval of vars, base64-to-shell, sensitive path writes, chmod 777, rm -rf / |
 | `zapier-title-check.sh` | PreToolUse | Blocks Zapier zap creation without a title |
+| `no-gstack-login.sh` | PreToolUse (Bash) | Blocks gstack browse on login-required sites (must use agent-browser) |
+| `trivial-pr-guard.sh` | PreToolUse (Bash) | Blocks `gh pr create` when diff is < 10 lines (commit to main instead) |
 | `workspace-token-gate.sh` | PreToolUse | Blocks Google Workspace MCP calls when tokens are broken |
 | `workspace-token-check.sh` | Cron | Checks Google Workspace token health hourly |
 | `chrome-tab-track.sh` | PostToolUse | Tracks tabs opened via Chrome DevTools MCP per terminal |
+| `headless-blocked-hint.sh` | PostToolUse (Bash) | Detects headless-blocked pages and suggests headed agent-browser |
+| `verification-code-hint.sh` | PostToolUse (Bash) | Detects email verification prompts and hints to check Gmail |
+| `mcp-tool-not-found.sh` | PostToolUse | Hints when MCP tool calls fail due to missing/disabled servers |
 | `chrome-tab-cleanup.sh` | Stop | Closes tabs owned by the exiting terminal |
 | `chrome-mcp-cleanup.sh` | Stop | Kills orphaned chrome-devtools-mcp node processes |
 | `agent-browser-cleanup.sh` | Stop | Closes agent-browser sessions owned by the exiting terminal |
+| `cleanup-owner.sh` | Stop | Cleans up ownership tracking files for the exiting terminal |
 | `notify-idle.sh` | Notification (idle) | Cascading audio notification: desktop, laptop, phone |
 | `notify-stop-debounce.sh` | Stop | 20s debounced fallback notification |
 | `session-save.sh` | Stop | Saves session summary to `~/.claude/sessions/YYYY-MM/` |
