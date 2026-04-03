@@ -1,7 +1,11 @@
 #!/bin/bash
 # enforce-memory-promises.sh
-# Stop hook: catches when Claude promises "saved to memory / won't happen again"
-# and forces it to actually implement enforcement at the right level.
+# Stop hook: catches when Claude writes/updates a feedback memory file
+# without also implementing real enforcement (hook, CLAUDE.md rule, etc.)
+#
+# Two detection strategies:
+# 1. Check tool calls: did Claude write to a feedback memory file this turn?
+# 2. Check prose: did Claude promise things won't happen again?
 #
 # Exit 0 = pass (Claude can stop)
 # Exit 2 = block (Claude must continue and implement real enforcement)
@@ -14,81 +18,125 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
 
-# Get the last assistant message
 MSG=$(echo "$INPUT" | jq -r '.last_assistant_message // ""')
-
-# Nothing to check
 if [ -z "$MSG" ]; then
   exit 0
 fi
 
-# Lowercase for matching
 MSG_LOWER=$(echo "$MSG" | tr '[:upper:]' '[:lower:]')
+TRIGGERED=""
 
-# Phrases that indicate Claude made a memory-only promise without real enforcement
-PATTERNS=(
-  "saved to memory"
-  "saved this to memory"
-  "stored in memory"
-  "noted in memory"
-  "added to memory"
-  "written to memory"
-  "updated memory"
-  "updated my memory"
-  "won't happen again"
-  "will not happen again"
-  "won't repeat"
-  "will not repeat"
-  "won't make that mistake"
-  "will not make that mistake"
-  "i'll remember"
-  "i will remember"
-  "noted for future"
-  "saved for future"
-  "i've noted this"
-  "i have noted this"
-  "recorded this feedback"
-  "saved this feedback"
-)
-
-MATCHED=""
-for pattern in "${PATTERNS[@]}"; do
-  if echo "$MSG_LOWER" | grep -qF "$pattern"; then
-    MATCHED="$pattern"
-    break
+# ── Strategy 1: Check if a feedback memory file was written ──
+# Look for Write/Edit tool calls to feedback memory files in the transcript
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // ""')
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  # Check last 200 lines of transcript for writes to feedback memory files
+  if tail -200 "$TRANSCRIPT" | grep -qE '"file_path".*memory/feedback_'; then
+    TRIGGERED="wrote feedback memory file"
   fi
-done
+fi
 
-# No promise detected, let Claude stop normally
-if [ -z "$MATCHED" ]; then
+# ── Strategy 2: Prose pattern matching (broader than before) ──
+if [ -z "$TRIGGERED" ]; then
+  # Memory-related phrases (catches more variations with regex)
+  MEMORY_PATTERNS=(
+    "saved.*memory"
+    "updated.*memory"
+    "update.*feedback"
+    "written.*memory"
+    "stored.*memory"
+    "noted.*memory"
+    "added.*memory"
+    "recorded.*feedback"
+    "saved.*feedback"
+  )
+
+  PROMISE_PATTERNS=(
+    "happen again"
+    "won't repeat"
+    "will not repeat"
+    "won't make that mistake"
+    "will not make that mistake"
+    "i'll remember"
+    "i will remember"
+    "noted for future"
+    "saved for future"
+    "i've noted this"
+    "i have noted this"
+    "doesn't happen again"
+    "does not happen again"
+    "prevent this in future"
+    "prevent this in the future"
+    "so this doesn't"
+    "so this won't"
+    "this is now fixed"
+  )
+
+  for pattern in "${MEMORY_PATTERNS[@]}"; do
+    if echo "$MSG_LOWER" | grep -qE "$pattern"; then
+      TRIGGERED="prose: $pattern"
+      break
+    fi
+  done
+
+  # Also check promise patterns (even without memory mention, a bare promise should trigger)
+  if [ -z "$TRIGGERED" ]; then
+    for pattern in "${PROMISE_PATTERNS[@]}"; do
+      if echo "$MSG_LOWER" | grep -qF "$pattern"; then
+        TRIGGERED="prose: $pattern"
+        break
+      fi
+    done
+  fi
+fi
+
+# Nothing triggered, let Claude stop
+if [ -z "$TRIGGERED" ]; then
   exit 0
 fi
 
-# Check if Claude ALSO mentioned implementing a hook, CLAUDE.md rule, or other enforcement
-# If real enforcement was discussed/implemented, don't block
+# ── Check if Claude ALSO discussed/implemented real enforcement ──
 ENFORCEMENT_KEYWORDS=(
   "stop hook"
   "pretooluse"
   "pre-tool-use"
+  "posttooluse"
+  "post-tool-use"
   "claude.md"
-  "claudemd"
   "settings.json"
   "enforcement"
   "hook script"
+  "hook that"
+  "hook to"
+  "build a hook"
+  "create a hook"
+  "wrote a hook"
   "exit code 2"
   "userpromptsubmit"
+  "type.*prompt"
 )
 
 for keyword in "${ENFORCEMENT_KEYWORDS[@]}"; do
-  if echo "$MSG_LOWER" | grep -qF "$keyword"; then
-    # Claude discussed real enforcement alongside the memory save, allow it
+  if echo "$MSG_LOWER" | grep -qE "$keyword"; then
+    # Real enforcement was discussed alongside the memory save, allow it
     exit 0
   fi
 done
 
-# Claude made a memory promise without discussing real enforcement. Block and escalate.
-cat >&2 <<'ENFORCE'
-STOP: You just promised something is "saved to memory" without implementing real enforcement.
+# Also check if a hook file was written/edited in this turn's transcript
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  if tail -200 "$TRANSCRIPT" | grep -qE '"file_path".*hooks/.*\.sh'; then
+    exit 0
+  fi
+  if tail -200 "$TRANSCRIPT" | grep -qE '"file_path".*settings\.json'; then
+    exit 0
+  fi
+fi
+
+# Claude made a memory/promise without real enforcement. Block and escalate.
+cat >&2 <<ENFORCE
+STOP: Triggered by: $TRIGGERED
+You updated a feedback memory or promised behavioral change without implementing real enforcement.
 
 Memory files alone are the WEAKEST form of enforcement (~40% reliability). Before you can finish this response, you MUST:
 

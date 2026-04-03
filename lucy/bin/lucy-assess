@@ -522,6 +522,7 @@ IMPORTANT: Output ONLY valid JSON matching this schema (no markdown, no backtick
       "summary": "1 sentence status",
       "key_decisions": ["notable decisions the agent made"],
       "assumptions_flagged": ["assumptions that look wrong or risky"],
+      "assumptions_resolved": ["previously flagged assumptions that the agent has now resolved or proven wrong - copy the exact flag text"],
       "risks": ["things that could go wrong"],
       "recommendation": "what the orchestrator should do, if anything"
     }
@@ -570,6 +571,52 @@ PROMPT_HEADER
     echo "---"
     echo ""
     echo "$context"
+  fi
+
+  # Previously flagged assumptions (so the LLM can check if they're resolved)
+  local prior_flags=""
+  if [ -f "$FEED_FILE" ]; then
+    prior_flags=$(grep '"type":"flag"' "$FEED_FILE" 2>/dev/null | while IFS= read -r line; do
+      local flag_task flag_msg flag_ts
+      flag_task=$(echo "$line" | jq -r '.task // ""')
+      flag_msg=$(echo "$line" | jq -r '.msg // ""')
+      flag_ts=$(echo "$line" | jq -r '.ts // ""')
+      echo "- [$flag_ts] $flag_task: $flag_msg"
+    done)
+    # Filter out already-resolved ones
+    if [ -f "$FEED_FILE" ] && [ -n "$prior_flags" ]; then
+      local resolved
+      resolved=$(grep '"type":"flag-resolved"' "$FEED_FILE" 2>/dev/null | jq -r '.msg // ""' | sort -u)
+      if [ -n "$resolved" ]; then
+        local filtered=""
+        while IFS= read -r flag_line; do
+          local is_resolved=false
+          while IFS= read -r res_line; do
+            [ -z "$res_line" ] && continue
+            if echo "$flag_line" | grep -qF "$res_line"; then
+              is_resolved=true
+              break
+            fi
+          done <<< "$resolved"
+          if ! $is_resolved; then
+            filtered="${filtered}${flag_line}"$'\n'
+          fi
+        done <<< "$prior_flags"
+        prior_flags="$filtered"
+      fi
+    fi
+  fi
+
+  if [ -n "$prior_flags" ]; then
+    echo ""
+    echo "---"
+    echo ""
+    echo "## Previously Flagged Assumptions (unresolved)"
+    echo ""
+    echo "These assumptions were flagged in prior assessment cycles. Check whether each is STILL a problem or has been RESOLVED by the agent's subsequent work. If resolved, include it in the assumptions_resolved array for that task."
+    echo ""
+    echo "$prior_flags"
+    echo ""
   fi
 
   # Known pitfalls (orchestrator's cross-cycle memory)
@@ -690,6 +737,9 @@ if start >= 0 and end > start:
   done
   echo "$json_response" | jq -r '.assessments | to_entries[] | .key as $tid | (.value.assumptions_flagged // [])[] | "\($tid)\t\(.)"' 2>/dev/null | while IFS=$'\t' read -r tid assumption; do
     feed_write "flag" "Flagged assumption: $assumption" "$tid"
+  done
+  echo "$json_response" | jq -r '.assessments | to_entries[] | .key as $tid | (.value.assumptions_resolved // [])[] | "\($tid)\t\(.)"' 2>/dev/null | while IFS=$'\t' read -r tid resolved; do
+    feed_write "flag-resolved" "Resolved: $resolved" "$tid"
   done
   echo "$json_response" | jq -r '.needs_input // [] | .[] | if type == "object" then "[\(.severity // "info")] \(.item // "")" else . end' 2>/dev/null | while IFS= read -r item; do
     feed_write "needs_input" "$item"

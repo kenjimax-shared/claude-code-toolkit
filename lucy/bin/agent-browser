@@ -21,19 +21,80 @@ TAG="[ab-safe]"
 mkdir -p "$OWNERS"
 
 # --- Workaround: --session-name auto-load is broken in agent-browser >=0.23 ---
-# After opening a session, explicitly load state from the saved state file.
-# This restores cookies/localStorage that --session-name should have loaded on startup.
-load_session_state() {
+# The native --session-name flag does NOT restore cookies on startup.
+# Fix: open about:blank first, load state synchronously, then navigate to the real URL.
+# This ensures cookies are present BEFORE the target page loads (avoiding login redirects).
+
+# Returns the state file path if one exists, empty string otherwise.
+find_state_file() {
     local ab_session="$1"
     local sname="$2"
     local state_enc="${SESSIONS}/${ab_session}-${sname}.json.enc"
     local state_json="${SESSIONS}/${ab_session}-${sname}.json"
 
     if [[ -f "$state_enc" ]]; then
-        "$REAL" --session "$ab_session" state load "$state_enc" >/dev/null 2>&1 &
+        echo "$state_enc"
     elif [[ -f "$state_json" ]]; then
-        "$REAL" --session "$ab_session" state load "$state_json" >/dev/null 2>&1 &
+        echo "$state_json"
     fi
+}
+
+# Opens a session with state pre-loaded before navigating to the target URL.
+# Usage: open_with_state <ab_session> <sname> <real_args...>
+# real_args should be the full argument list for agent-browser (including open <url>).
+open_with_state() {
+    local ab_session="$1"
+    local sname="$2"
+    shift 2
+    local real_args=("$@")
+
+    local state_file
+    state_file=$(find_state_file "$ab_session" "$sname")
+
+    if [[ -z "$state_file" ]]; then
+        # No saved state; open directly (fast path)
+        "$REAL" "${real_args[@]}"
+        return $?
+    fi
+
+    # Extract the URL from the args (last arg after open/connect)
+    local target_url=""
+    local open_args=()
+    local found_open=false
+    for arg in "${real_args[@]}"; do
+        if [[ "$arg" == "open" || "$arg" == "connect" ]]; then
+            found_open=true
+            open_args+=("$arg")
+        elif $found_open && [[ -z "$target_url" ]] && [[ "$arg" != --* ]]; then
+            target_url="$arg"
+            # Replace URL with about:blank for initial open
+            open_args+=("about:blank")
+        else
+            open_args+=("$arg")
+        fi
+    done
+
+    if [[ -z "$target_url" ]]; then
+        # No URL found (bare open); just open directly
+        "$REAL" "${real_args[@]}"
+        return $?
+    fi
+
+    # Step 1: Open about:blank (instant, no redirects)
+    "$REAL" "${open_args[@]}" >/dev/null 2>&1
+    local ret=$?
+    if [[ $ret -ne 0 ]]; then
+        # Fallback: try direct open
+        "$REAL" "${real_args[@]}"
+        return $?
+    fi
+
+    # Step 2: Load state synchronously (cookies injected before navigation)
+    "$REAL" --session "$ab_session" state load "$state_file" >/dev/null 2>&1
+
+    # Step 3: Navigate to the real URL (now with cookies present)
+    "$REAL" --session "$ab_session" navigate "$target_url" 2>&1
+    return $?
 }
 
 # --- Terminal identity ---
@@ -125,7 +186,7 @@ for ((i=0; i<${#args[@]}; i++)); do
                         [[ $((i+1)) -lt ${#args[@]} ]] && url_arg="${args[i+1]}"
                         ;;
         close)          is_close=true; has_subcommand=true ;;
-        snapshot|click|fill|navigate|type|scroll|wait|select|hover|exec|screenshot|state)
+        snapshot|click|dblclick|fill|navigate|type|scroll|scrollintoview|wait|select|hover|focus|check|uncheck|drag|upload|download|press|keyboard|exec|eval|screenshot|pdf|reload|back|forward|get|find|is|mouse|set|network|state)
                         has_subcommand=true ;;
     esac
 done
@@ -195,14 +256,13 @@ if $is_open && [[ -n "$session" ]]; then
         set_derivative "$session" "$derivative"
         track_ownership "$derivative"
 
-        # Build the derivative command (no exec: we need to load state after)
-        "$REAL" --session "$derivative" \
+        # Open derivative with state pre-loaded before navigating
+        open_with_state "$derivative" "$session" \
+            --session "$derivative" \
             --profile "$deriv_profile" \
             --session-name "$session" \
             open ${url_arg:+"$url_arg"}
-        ret=$?
-        load_session_state "$derivative" "$session"
-        exit $ret
+        exit $?
     fi
 
     # Session is NOT running; this terminal gets to be the primary owner
@@ -253,16 +313,12 @@ if $is_open && [[ -n "$session" ]]; then
             fi
             final+=("$arg")
         done
-        "$REAL" "${final[@]}"
-        ret=$?
-        load_session_state "$session" "$effective_sname"
-        exit $ret
+        open_with_state "$session" "$effective_sname" "${final[@]}"
+        exit $?
     fi
 
-    "$REAL" "$@"
-    ret=$?
-    load_session_state "$session" "$effective_sname"
-    exit $ret
+    open_with_state "$session" "$effective_sname" "$@"
+    exit $?
 fi
 
 # Handle explicit close: clean up derivative mapping + untrack ownership

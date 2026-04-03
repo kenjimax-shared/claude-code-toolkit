@@ -16,3 +16,5 @@
 */30 * * * * /home/user/.claude/lucy/bin/agent-browser-reap-orphans >> /home/user/.agent-browser/reap-orphans.log 2>&1
 # MCP health check: validate npm packages weekly (Sundays 3am)
 0 3 * * 0 /home/user/.claude/mcp-health-check --quiet >> /home/user/.claude/mcp-health-check.log 2>&1
+# Claude snooze: Check Statsig v5 experiment data after overnight collection
+0 8 3 4 * /home/user/.claude/snooze-resume.sh fdfd62a2-d2be-4fc4-9aaf-ff7956bd7066 "Check Statsig v5 experiment data after overnight collection" "exampleco-metrics-debug"

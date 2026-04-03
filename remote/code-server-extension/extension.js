@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const HOME = process.env.HOME || '/home/kenji';
+const HOME = process.env.HOME || '/home/user';
 const SNOOZE_DIR = path.join(HOME, '.claude', 'snooze-active');
 
 // Track terminals we opened this session, so we can distinguish
